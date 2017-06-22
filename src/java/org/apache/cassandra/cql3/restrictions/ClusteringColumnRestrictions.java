@@ -19,8 +19,8 @@ package org.apache.cassandra.cql3.restrictions;
 
 import java.util.*;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.statements.Bound;
 import org.apache.cassandra.db.*;
@@ -47,14 +47,14 @@ final class ClusteringColumnRestrictions extends RestrictionSetWrapper
      */
     private final boolean allowFiltering;
 
-    public ClusteringColumnRestrictions(CFMetaData cfm)
+    public ClusteringColumnRestrictions(TableMetadata table)
     {
-        this(cfm, false);
+        this(table, false);
     }
 
-    public ClusteringColumnRestrictions(CFMetaData cfm, boolean allowFiltering)
+    public ClusteringColumnRestrictions(TableMetadata table, boolean allowFiltering)
     {
-        this(cfm.comparator, new RestrictionSet(), allowFiltering);
+        this(table.comparator, new RestrictionSet(), allowFiltering);
     }
 
     private ClusteringColumnRestrictions(ClusteringComparator comparator,
@@ -74,8 +74,8 @@ final class ClusteringColumnRestrictions extends RestrictionSetWrapper
         if (!isEmpty() && !allowFiltering)
         {
             SingleRestriction lastRestriction = restrictions.lastRestriction();
-            ColumnDefinition lastRestrictionStart = lastRestriction.getFirstColumn();
-            ColumnDefinition newRestrictionStart = restriction.getFirstColumn();
+            ColumnMetadata lastRestrictionStart = lastRestriction.getFirstColumn();
+            ColumnMetadata newRestrictionStart = restriction.getFirstColumn();
 
             checkFalse(lastRestriction.isSlice() && newRestrictionStart.position() > lastRestrictionStart.position(),
                        "Clustering column \"%s\" cannot be restricted (preceding column \"%s\" is restricted by a non-EQ relation)",
@@ -152,7 +152,12 @@ final class ClusteringColumnRestrictions extends RestrictionSetWrapper
      */
     public final boolean hasContains()
     {
-        return restrictions.stream().anyMatch(SingleRestriction::isContains);
+        for (SingleRestriction restriction : restrictions)
+        {
+            if (restriction.isContains())
+                return true;
+        }
+        return false;
     }
 
     /**
@@ -163,7 +168,12 @@ final class ClusteringColumnRestrictions extends RestrictionSetWrapper
      */
     public final boolean hasSlice()
     {
-        return restrictions.stream().anyMatch(SingleRestriction::isSlice);
+        for (SingleRestriction restriction : restrictions)
+        {
+            if (restriction.isSlice())
+                return true;
+        }
+        return false;
     }
 
     /**
@@ -175,18 +185,13 @@ final class ClusteringColumnRestrictions extends RestrictionSetWrapper
     public final boolean needFiltering()
     {
         int position = 0;
-        SingleRestriction slice = null;
+
         for (SingleRestriction restriction : restrictions)
         {
             if (handleInFilter(restriction, position))
                 return true;
 
-            if (slice != null && !slice.getFirstColumn().equals(restriction.getFirstColumn()))
-                return true;
-
-            if (slice == null && restriction.isSlice())
-                slice = restriction;
-            else
+            if (!restriction.isSlice())
                 position = restriction.getLastColumn().position() + 1;
         }
         return hasContains();
@@ -199,7 +204,6 @@ final class ClusteringColumnRestrictions extends RestrictionSetWrapper
     {
         int position = 0;
 
-        SingleRestriction slice = null;
         for (SingleRestriction restriction : restrictions)
         {
             // We ignore all the clustering columns that can be handled by slices.
@@ -209,20 +213,13 @@ final class ClusteringColumnRestrictions extends RestrictionSetWrapper
                 continue;
             }
 
-            if (slice != null && !slice.getFirstColumn().equals(restriction.getFirstColumn()))
-            {
-                restriction.addRowFilterTo(filter, indexManager, options);
-                continue;
-            }
-
-            if (slice == null && restriction.isSlice())
-                slice = restriction;
-            else
+            if (!restriction.isSlice())
                 position = restriction.getLastColumn().position() + 1;
         }
     }
 
-    private boolean handleInFilter(SingleRestriction restriction, int index) {
+    private boolean handleInFilter(SingleRestriction restriction, int index)
+    {
         return restriction.isContains() || restriction.isLIKE() || index != restriction.getFirstColumn().position();
     }
 

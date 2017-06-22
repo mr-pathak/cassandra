@@ -29,20 +29,21 @@ import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.netty.util.concurrent.FastThreadLocalThread;
 import net.jpountz.lz4.LZ4BlockInputStream;
 import net.jpountz.lz4.LZ4FastDecompressor;
 import net.jpountz.lz4.LZ4Factory;
 import net.jpountz.xxhash.XXHashFactory;
 
 import org.apache.cassandra.config.Config;
-import org.xerial.snappy.SnappyInputStream;
+import org.apache.cassandra.exceptions.UnknownTableException;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.UnknownColumnFamilyException;
+import org.apache.cassandra.db.monitoring.ApproximateTime;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataInputPlus.DataInputStreamPlus;
 import org.apache.cassandra.io.util.NIODataInputStream;
 
-public class IncomingTcpConnection extends Thread implements Closeable
+public class IncomingTcpConnection extends FastThreadLocalThread implements Closeable
 {
     private static final Logger logger = LoggerFactory.getLogger(IncomingTcpConnection.class);
 
@@ -61,7 +62,7 @@ public class IncomingTcpConnection extends Thread implements Closeable
         this.compressed = compressed;
         this.socket = socket;
         this.group = group;
-        if (DatabaseDescriptor.getInternodeRecvBufferSize() != null)
+        if (DatabaseDescriptor.getInternodeRecvBufferSize() > 0)
         {
             try
             {
@@ -84,9 +85,9 @@ public class IncomingTcpConnection extends Thread implements Closeable
     {
         try
         {
-            if (version < MessagingService.VERSION_20)
+            if (version < MessagingService.VERSION_30)
                 throw new UnsupportedOperationException(String.format("Unable to read obsolete message version %s; "
-                                                                      + "The earliest version supported is 2.0.0",
+                                                                      + "The earliest version supported is 3.0.0",
                                                                       version));
 
             receiveMessages();
@@ -96,9 +97,9 @@ public class IncomingTcpConnection extends Thread implements Closeable
             logger.trace("eof reading from socket; closing", e);
             // connection will be reset so no need to throw an exception.
         }
-        catch (UnknownColumnFamilyException e)
+        catch (UnknownTableException e)
         {
-            logger.warn("UnknownColumnFamilyException reading from socket; closing", e);
+            logger.warn("UnknownTableException reading from socket; closing", e);
         }
         catch (IOException e)
         {
@@ -153,18 +154,11 @@ public class IncomingTcpConnection extends Thread implements Closeable
         if (compressed)
         {
             logger.trace("Upgrading incoming connection to be compressed");
-            if (version < MessagingService.VERSION_21)
-            {
-                in = new DataInputStreamPlus(new SnappyInputStream(socket.getInputStream()));
-            }
-            else
-            {
-                LZ4FastDecompressor decompressor = LZ4Factory.fastestInstance().fastDecompressor();
-                Checksum checksum = XXHashFactory.fastestInstance().newStreamingHash32(OutboundTcpConnection.LZ4_HASH_SEED).asChecksum();
-                in = new DataInputStreamPlus(new LZ4BlockInputStream(socket.getInputStream(),
-                                                                 decompressor,
-                                                                 checksum));
-            }
+            LZ4FastDecompressor decompressor = LZ4Factory.fastestInstance().fastDecompressor();
+            Checksum checksum = XXHashFactory.fastestInstance().newStreamingHash32(OutboundTcpConnection.LZ4_HASH_SEED).asChecksum();
+            in = new DataInputStreamPlus(new LZ4BlockInputStream(socket.getInputStream(),
+                                                             decompressor,
+                                                             checksum));
         }
         else
         {
@@ -181,13 +175,10 @@ public class IncomingTcpConnection extends Thread implements Closeable
 
     private InetAddress receiveMessage(DataInputPlus input, int version) throws IOException
     {
-        int id;
-        if (version < MessagingService.VERSION_20)
-            id = Integer.parseInt(input.readUTF());
-        else
-            id = input.readInt();
+        int id = input.readInt();
 
-        MessageIn message = MessageIn.read(input, version, id, MessageIn.readTimestamp(input));
+        long currentTime = ApproximateTime.currentTimeMillis();
+        MessageIn message = MessageIn.read(input, version, id, MessageIn.readConstructionTime(from, input, currentTime));
         if (message == null)
         {
             // callback expired; nothing to do

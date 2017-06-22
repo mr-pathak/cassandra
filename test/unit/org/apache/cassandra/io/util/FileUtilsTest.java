@@ -21,24 +21,28 @@ package org.apache.cassandra.io.util;
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
-import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Arrays;
 
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.cql3.CQLTester;
-import org.apache.cassandra.schema.SchemaKeyspace;
-import org.apache.cassandra.utils.FBUtilities;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 public class FileUtilsTest
 {
+
+    @BeforeClass
+    public static void setupDD()
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
 
     @Test
     public void testTruncate() throws IOException
@@ -50,11 +54,11 @@ public class FileUtilsTest
         assertTrue(file.exists());
 
         byte[] b = Files.readAllBytes(file.toPath());
-        assertEquals(expected, new String(b, Charset.forName("UTF-8")));
+        assertEquals(expected, new String(b, StandardCharsets.UTF_8));
 
         FileUtils.truncate(file.getAbsolutePath(), 10);
         b = Files.readAllBytes(file.toPath());
-        assertEquals("The quick ", new String(b, Charset.forName("UTF-8")));
+        assertEquals("The quick ", new String(b, StandardCharsets.UTF_8));
 
         FileUtils.truncate(file.getAbsolutePath(), 0);
         b = Files.readAllBytes(file.toPath());
@@ -93,9 +97,8 @@ public class FileUtilsTest
 
     private File createFile(File file, long size)
     {
-        try
+        try (RandomAccessFile f = new RandomAccessFile(file, "rw"))
         {
-            RandomAccessFile f = new RandomAccessFile(file, "rw");
             f.setLength(size);
         }
         catch (Exception e)

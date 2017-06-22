@@ -20,29 +20,27 @@ package org.apache.cassandra.io.sstable;
 
 import java.io.File;
 import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.util.*;
-import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Sets;
-import org.junit.After;
-import org.junit.AfterClass;
-import org.junit.BeforeClass;
 import com.google.common.util.concurrent.Uninterruptibles;
 import org.junit.Test;
 
-import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
 import org.apache.cassandra.UpdateBuilder;
-import org.apache.cassandra.config.Config;
+import org.apache.cassandra.concurrent.NamedThreadFactory;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.RowUpdateBuilder;
 import org.apache.cassandra.db.SerializationHeader;
+import org.apache.cassandra.db.lifecycle.View;
 import org.apache.cassandra.db.rows.EncodingStats;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.compaction.AbstractCompactionStrategy;
@@ -54,14 +52,12 @@ import org.apache.cassandra.db.partitions.ImmutableBTreePartition;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
-import org.apache.cassandra.db.lifecycle.View;
-import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.apache.cassandra.io.sstable.format.SSTableWriter;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.metrics.StorageMetrics;
-import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.streaming.PreviewKind;
+import org.apache.cassandra.streaming.StreamSession;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Pair;
@@ -80,7 +76,7 @@ public class SSTableRewriterTest extends SSTableWriterTestBase
 
         for (int j = 0; j < 100; j ++)
         {
-            new RowUpdateBuilder(cfs.metadata, j, String.valueOf(j))
+            new RowUpdateBuilder(cfs.metadata(), j, String.valueOf(j))
                 .clustering("0")
                 .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
                 .build()
@@ -105,9 +101,9 @@ public class SSTableRewriterTest extends SSTableWriterTestBase
             writer.finish();
         }
         LifecycleTransaction.waitForDeletions();
+        assertEquals(1, assertFileCounts(sstables.iterator().next().descriptor.directory.list()));
+
         validateCFS(cfs);
-        int filecounts = assertFileCounts(sstables.iterator().next().descriptor.directory.list());
-        assertEquals(1, filecounts);
         truncate(cfs);
     }
     @Test
@@ -137,9 +133,9 @@ public class SSTableRewriterTest extends SSTableWriterTestBase
             writer.finish();
         }
         LifecycleTransaction.waitForDeletions();
+        assertEquals(1, assertFileCounts(sstables.iterator().next().descriptor.directory.list()));
+
         validateCFS(cfs);
-        int filecounts = assertFileCounts(sstables.iterator().next().descriptor.directory.list());
-        assertEquals(1, filecounts);
     }
 
     @Test
@@ -192,9 +188,9 @@ public class SSTableRewriterTest extends SSTableWriterTestBase
             writer.finish();
         }
         LifecycleTransaction.waitForDeletions();
+        assertEquals(1, assertFileCounts(sstables.iterator().next().descriptor.directory.list()));
+
         validateCFS(cfs);
-        int filecounts = assertFileCounts(sstables.iterator().next().descriptor.directory.list());
-        assertEquals(1, filecounts);
         truncate(cfs);
     }
 
@@ -697,7 +693,7 @@ public class SSTableRewriterTest extends SSTableWriterTestBase
             String key = Integer.toString(i);
 
             for (int j = 0; j < 10; j++)
-                new RowUpdateBuilder(cfs.metadata, 100, key)
+                new RowUpdateBuilder(cfs.metadata(), 100, key)
                     .clustering(Integer.toString(j))
                     .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
                     .build()
@@ -765,7 +761,7 @@ public class SSTableRewriterTest extends SSTableWriterTestBase
                 if (!checked && writer.currentWriter().getFilePointer() > 15000000)
                 {
                     checked = true;
-                    ColumnFamilyStore.ViewFragment viewFragment = cfs.select(View.select(SSTableSet.CANONICAL));
+                    ColumnFamilyStore.ViewFragment viewFragment = cfs.select(View.selectFunction(SSTableSet.CANONICAL));
                     // canonical view should have only one SSTable which is not opened early.
                     assertEquals(1, viewFragment.sstables.size());
                     SSTableReader sstable = viewFragment.sstables.get(0);
@@ -776,6 +772,65 @@ public class SSTableRewriterTest extends SSTableWriterTestBase
         }
         truncateCF();
         validateCFS(cfs);
+    }
+
+    @Test
+    public void testSSTableSectionsForRanges() throws IOException, InterruptedException, ExecutionException
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE);
+        final ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF);
+        truncate(cfs);
+
+        cfs.addSSTable(writeFile(cfs, 1000));
+
+        Collection<SSTableReader> allSSTables = cfs.getLiveSSTables();
+        assertEquals(1, allSSTables.size());
+        final Token firstToken = allSSTables.iterator().next().first.getToken();
+        DatabaseDescriptor.setSSTablePreempiveOpenIntervalInMB(1);
+
+        List<StreamSession.SSTableStreamingSections> sectionsBeforeRewrite = StreamSession.getSSTableSectionsForRanges(
+            Collections.singleton(new Range<Token>(firstToken, firstToken)),
+            Collections.singleton(cfs), null, PreviewKind.NONE);
+        assertEquals(1, sectionsBeforeRewrite.size());
+        for (StreamSession.SSTableStreamingSections section : sectionsBeforeRewrite)
+            section.ref.release();
+        final AtomicInteger checkCount = new AtomicInteger();
+        // needed since we get notified when compaction is done as well - we can't get sections for ranges for obsoleted sstables
+        final AtomicBoolean done = new AtomicBoolean(false);
+        final AtomicBoolean failed = new AtomicBoolean(false);
+        Runnable r = new Runnable()
+        {
+            public void run()
+            {
+                while (!done.get())
+                {
+                    Set<Range<Token>> range = Collections.singleton(new Range<Token>(firstToken, firstToken));
+                    List<StreamSession.SSTableStreamingSections> sections = StreamSession.getSSTableSectionsForRanges(range, Collections.singleton(cfs), null, PreviewKind.NONE);
+                    if (sections.size() != 1)
+                        failed.set(true);
+                    for (StreamSession.SSTableStreamingSections section : sections)
+                        section.ref.release();
+                    checkCount.incrementAndGet();
+                    Uninterruptibles.sleepUninterruptibly(5, TimeUnit.MILLISECONDS);
+                }
+            }
+        };
+        Thread t = NamedThreadFactory.createThread(r);
+        try
+        {
+            t.start();
+            cfs.forceMajorCompaction();
+            // reset
+        }
+        finally
+        {
+            DatabaseDescriptor.setSSTablePreempiveOpenIntervalInMB(50);
+            done.set(true);
+            t.join(20);
+        }
+        assertFalse(failed.get());
+        assertTrue(checkCount.get() >= 2);
+        truncate(cfs);
     }
 
     /**
@@ -819,6 +874,45 @@ public class SSTableRewriterTest extends SSTableWriterTestBase
         validateCFS(cfs);
     }
 
+    @Test
+    public void testCanonicalSSTables() throws ExecutionException, InterruptedException
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE);
+        final ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF);
+        truncate(cfs);
+
+        cfs.addSSTable(writeFile(cfs, 100));
+        Collection<SSTableReader> allSSTables = cfs.getLiveSSTables();
+        assertEquals(1, allSSTables.size());
+        final AtomicBoolean done = new AtomicBoolean(false);
+        final AtomicBoolean failed = new AtomicBoolean(false);
+        Runnable r = () -> {
+            while (!done.get())
+            {
+                Iterable<SSTableReader> sstables = cfs.getSSTables(SSTableSet.CANONICAL);
+                if (Iterables.size(sstables) != 1)
+                {
+                    failed.set(true);
+                    return;
+                }
+            }
+        };
+        Thread t = NamedThreadFactory.createThread(r);
+        try
+        {
+            t.start();
+            cfs.forceMajorCompaction();
+        }
+        finally
+        {
+            done.set(true);
+            t.join(20);
+        }
+        assertFalse(failed.get());
+
+
+    }
+
     private void validateKeys(Keyspace ks)
     {
         for (int i = 0; i < 100; i++)
@@ -841,14 +935,14 @@ public class SSTableRewriterTest extends SSTableWriterTestBase
         for (int f = 0 ; f < fileCount ; f++)
         {
             File dir = cfs.getDirectories().getDirectoryForNewSSTables();
-            String filename = cfs.getSSTablePath(dir);
+            Descriptor desc = cfs.newSSTableDescriptor(dir);
 
-            try (SSTableTxnWriter writer = SSTableTxnWriter.create(cfs, filename, 0, 0, new SerializationHeader(true, cfs.metadata, cfs.metadata.partitionColumns(), EncodingStats.NO_STATS)))
+            try (SSTableTxnWriter writer = SSTableTxnWriter.create(cfs, desc, 0, 0, null, new SerializationHeader(true, cfs.metadata(), cfs.metadata().regularAndStaticColumns(), EncodingStats.NO_STATS)))
             {
                 int end = f == fileCount - 1 ? partitionCount : ((f + 1) * partitionCount) / fileCount;
                 for ( ; i < end ; i++)
                 {
-                    UpdateBuilder builder = UpdateBuilder.create(cfs.metadata, ByteBufferUtil.bytes(i));
+                    UpdateBuilder builder = UpdateBuilder.create(cfs.metadata(), ByteBufferUtil.bytes(i));
                     for (int j = 0; j < cellCount ; j++)
                         builder.newRow(Integer.toString(i)).add("val", random(0, 1000));
 

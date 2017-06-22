@@ -17,12 +17,16 @@
  */
 package org.apache.cassandra.db;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
 
 import javax.management.openmbean.CompositeData;
 import javax.management.openmbean.OpenDataException;
+
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
 
 /**
  * The MBean interface for ColumnFamilyStore
@@ -44,6 +48,10 @@ public interface ColumnFamilyStoreMBean
      */
     public void forceMajorCompaction(boolean splitOutput) throws ExecutionException, InterruptedException;
 
+    /**
+     * force a major compaction of specified key range in this column family
+     */
+    public void forceCompactionForTokenRange(Collection<Range<Token>> tokenRanges) throws ExecutionException, InterruptedException;
     /**
      * Gets the minimum number of sstables in queue before compaction kicks off
      */
@@ -94,11 +102,14 @@ public interface ColumnFamilyStoreMBean
      */
     public Map<String,String> getCompressionParameters();
 
+    public String getCompressionParametersJson();
+
     /**
-     * Set the compression parameters
+     * Set the compression parameters locally for this node
      * @param opts map of string names to values
      */
     public void setCompressionParameters(Map<String,String> opts);
+    public void setCompressionParametersJson(String options);
 
     /**
      * Set new crc check chance
@@ -149,6 +160,11 @@ public interface ColumnFamilyStoreMBean
     public int[] getSSTableCountPerLevel();
 
     /**
+     * @return sstable fanout size for level compaction strategy.
+     */
+    public int getLevelFanoutSize();
+
+    /**
      * Get the ratio of droppable tombstones to real columns (and non-droppable tombstones)
      * @return ratio
      */
@@ -169,4 +185,14 @@ public interface ColumnFamilyStoreMBean
      * @return top <i>count</i> items for the sampler since beginLocalSampling was called
      */
     public CompositeData finishLocalSampling(String sampler, int count) throws OpenDataException;
+
+    /*
+        Is Compaction space check enabled
+     */
+    public boolean isCompactionDiskSpaceCheckEnabled();
+
+    /*
+       Enable/Disable compaction space check
+     */
+    public void compactionDiskSpaceCheck(boolean enable);
 }

@@ -21,7 +21,7 @@ import java.nio.ByteBuffer;
 import java.security.MessageDigest;
 import java.util.Objects;
 
-import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.utils.memory.AbstractAllocator;
 
@@ -118,13 +118,21 @@ public class RangeTombstoneBoundMarker extends AbstractRangeTombstoneMarker<Clus
         return new RangeTombstoneBoundMarker(clustering().copy(allocator), deletion);
     }
 
+    public RangeTombstoneBoundMarker withNewOpeningDeletionTime(boolean reversed, DeletionTime newDeletionTime)
+    {
+        if (!isOpen(reversed))
+            throw new IllegalStateException();
+
+        return new RangeTombstoneBoundMarker(clustering(), newDeletionTime);
+    }
+
     public void digest(MessageDigest digest)
     {
         bound.digest(digest);
         deletion.digest(digest);
     }
 
-    public String toString(CFMetaData metadata)
+    public String toString(TableMetadata metadata)
     {
         return "Marker " + bound.toString(metadata) + '@' + deletion.markedForDeleteAt();
     }

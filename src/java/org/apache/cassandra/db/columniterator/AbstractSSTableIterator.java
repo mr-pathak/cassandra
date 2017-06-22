@@ -22,7 +22,7 @@ import java.util.Comparator;
 import java.util.Iterator;
 import java.util.NoSuchElementException;
 
-import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.rows.*;
@@ -31,12 +31,15 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.CorruptSSTableException;
 import org.apache.cassandra.io.util.FileDataInput;
 import org.apache.cassandra.io.util.DataPosition;
-import org.apache.cassandra.io.util.SegmentedFile;
+import org.apache.cassandra.io.util.FileHandle;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 public abstract class AbstractSSTableIterator implements UnfilteredRowIterator
 {
     protected final SSTableReader sstable;
+    // We could use sstable.metadata(), but that can change during execution so it's good hygiene to grab an immutable instance
+    protected final TableMetadata metadata;
+
     protected final DecoratedKey key;
     protected final DeletionTime partitionLevelDeletion;
     protected final ColumnFilter columns;
@@ -45,14 +48,11 @@ public abstract class AbstractSSTableIterator implements UnfilteredRowIterator
     protected final Row staticRow;
     protected final Reader reader;
 
-    private final boolean isForThrift;
-
-    protected final SegmentedFile ifile;
+    protected final FileHandle ifile;
 
     private boolean isClosed;
 
     protected final Slices slices;
-    protected int slice;
 
     @SuppressWarnings("resource") // We need this because the analysis is not able to determine that we do close
                                   // file on every path where we created it.
@@ -62,16 +62,15 @@ public abstract class AbstractSSTableIterator implements UnfilteredRowIterator
                                       RowIndexEntry indexEntry,
                                       Slices slices,
                                       ColumnFilter columnFilter,
-                                      boolean isForThrift,
-                                      SegmentedFile ifile)
+                                      FileHandle ifile)
     {
         this.sstable = sstable;
+        this.metadata = sstable.metadata();
         this.ifile = ifile;
         this.key = key;
         this.columns = columnFilter;
         this.slices = slices;
-        this.helper = new SerializationHelper(sstable.metadata, sstable.descriptor.version.correspondingMessagingVersion(), SerializationHelper.Flag.LOCAL, columnFilter);
-        this.isForThrift = isForThrift;
+        this.helper = new SerializationHelper(metadata, sstable.descriptor.version.correspondingMessagingVersion(), SerializationHelper.Flag.LOCAL, columnFilter);
 
         if (indexEntry == null)
         {
@@ -90,12 +89,6 @@ public abstract class AbstractSSTableIterator implements UnfilteredRowIterator
                 //   - we're querying static columns.
                 boolean needSeekAtPartitionStart = !indexEntry.isIndexed() || !columns.fetchedColumns().statics.isEmpty();
 
-                // For CQL queries on static compact tables, we only want to consider static value (only those are exposed),
-                // but readStaticRow have already read them and might in fact have consumed the whole partition (when reading
-                // the legacy file format), so set the reader to null so we don't try to read anything more. We can remove this
-                // once we drop support for the legacy file format
-                boolean needsReader = sstable.descriptor.version.storeRows() || isForThrift || !sstable.metadata.isStaticCompactTable();
-
                 if (needSeekAtPartitionStart)
                 {
                     // Not indexed (or is reading static), set to the beginning of the partition and read partition level deletion there
@@ -109,18 +102,18 @@ public abstract class AbstractSSTableIterator implements UnfilteredRowIterator
 
                     // Note that this needs to be called after file != null and after the partitionDeletion has been set, but before readStaticRow
                     // (since it uses it) so we can't move that up (but we'll be able to simplify as soon as we drop support for the old file format).
-                    this.reader = needsReader ? createReader(indexEntry, file, shouldCloseFile) : null;
-                    this.staticRow = readStaticRow(sstable, file, helper, columns.fetchedColumns().statics, isForThrift, reader == null ? null : reader.deserializer);
+                    this.reader = createReader(indexEntry, file, shouldCloseFile);
+                    this.staticRow = readStaticRow(sstable, file, helper, columns.fetchedColumns().statics);
                 }
                 else
                 {
                     this.partitionLevelDeletion = indexEntry.deletionTime();
                     this.staticRow = Rows.EMPTY_STATIC_ROW;
-                    this.reader = needsReader ? createReader(indexEntry, file, shouldCloseFile) : null;
+                    this.reader = createReader(indexEntry, file, shouldCloseFile);
                 }
 
                 if (reader != null && !slices.isEmpty())
-                    reader.setForSlice(slices.get(0));
+                    reader.setForSlice(nextSlice());
 
                 if (reader == null && file != null && shouldCloseFile)
                     file.close();
@@ -145,40 +138,28 @@ public abstract class AbstractSSTableIterator implements UnfilteredRowIterator
         }
     }
 
+    private Slice nextSlice()
+    {
+        return slices.get(nextSliceIndex());
+    }
+
+    /**
+     * Returns the index of the next slice to process.
+     * @return the index of the next slice to process
+     */
+    protected abstract int nextSliceIndex();
+
+    /**
+     * Checks if there are more slice to process.
+     * @return {@code true} if there are more slice to process, {@code false} otherwise.
+     */
+    protected abstract boolean hasMoreSlices();
+
     private static Row readStaticRow(SSTableReader sstable,
                                      FileDataInput file,
                                      SerializationHelper helper,
-                                     Columns statics,
-                                     boolean isForThrift,
-                                     UnfilteredDeserializer deserializer) throws IOException
+                                     Columns statics) throws IOException
     {
-        if (!sstable.descriptor.version.storeRows())
-        {
-            if (!sstable.metadata.isCompactTable())
-            {
-                assert deserializer != null;
-                return deserializer.hasNext() && deserializer.nextIsStatic()
-                     ? (Row)deserializer.readNext()
-                     : Rows.EMPTY_STATIC_ROW;
-            }
-
-            // For compact tables, we use statics for the "column_metadata" definition. However, in the old format, those
-            // "column_metadata" are intermingled as any other "cell". In theory, this means that we'd have to do a first
-            // pass to extract the static values. However, for thrift, we'll use the ThriftResultsMerger right away which
-            // will re-merge static values with dynamic ones, so we can just ignore static and read every cell as a
-            // "dynamic" one. For CQL, if the table is a "static compact", then is has only static columns exposed and no
-            // dynamic ones. So we do a pass to extract static columns here, but will have no more work to do. Otherwise,
-            // the table won't have static columns.
-            if (statics.isEmpty() || isForThrift)
-                return Rows.EMPTY_STATIC_ROW;
-
-            assert sstable.metadata.isStaticCompactTable();
-
-            // As said above, if it's a CQL query and the table is a "static compact", the only exposed columns are the
-            // static ones. So we don't have to mark the position to seek back later.
-            return LegacyLayout.extractStaticColumns(sstable.metadata, file, statics);
-        }
-
         if (!sstable.header.hasStatic())
             return Rows.EMPTY_STATIC_ROW;
 
@@ -201,12 +182,12 @@ public abstract class AbstractSSTableIterator implements UnfilteredRowIterator
                                 : createReaderInternal(indexEntry, file, shouldCloseFile);
     };
 
-    public CFMetaData metadata()
+    public TableMetadata metadata()
     {
-        return sstable.metadata;
+        return metadata;
     }
 
-    public PartitionColumns columns()
+    public RegularAndStaticColumns columns()
     {
         return columns.fetchedColumns();
     }
@@ -241,10 +222,10 @@ public abstract class AbstractSSTableIterator implements UnfilteredRowIterator
             if (reader.hasNext())
                 return true;
 
-            if (++slice >= slices.size())
+            if (!hasMoreSlices())
                 return false;
 
-            slice(slices.get(slice));
+            slice(nextSlice());
         }
     }
 
@@ -329,7 +310,7 @@ public abstract class AbstractSSTableIterator implements UnfilteredRowIterator
         private void createDeserializer()
         {
             assert file != null && deserializer == null;
-            deserializer = UnfilteredDeserializer.create(sstable.metadata, file, sstable.header, helper, partitionLevelDeletion, isForThrift);
+            deserializer = UnfilteredDeserializer.create(metadata, file, sstable.header, helper);
         }
 
         protected void seekToPosition(long position) throws IOException
@@ -359,13 +340,13 @@ public abstract class AbstractSSTableIterator implements UnfilteredRowIterator
             return toReturn;
         }
 
-        public boolean hasNext() 
+        public boolean hasNext()
         {
             try
             {
                 return hasNextInternal();
             }
-            catch (IOException e)
+            catch (IOException | IndexOutOfBoundsException e)
             {
                 try
                 {
@@ -453,7 +434,7 @@ public abstract class AbstractSSTableIterator implements UnfilteredRowIterator
         // Marks the beginning of the block corresponding to currentIndexIdx.
         private DataPosition mark;
 
-        public IndexState(Reader reader, ClusteringComparator comparator, RowIndexEntry indexEntry, boolean reversed, SegmentedFile indexFile)
+        public IndexState(Reader reader, ClusteringComparator comparator, RowIndexEntry indexEntry, boolean reversed, FileHandle indexFile)
         {
             this.reader = reader;
             this.comparator = comparator;
@@ -534,8 +515,7 @@ public abstract class AbstractSSTableIterator implements UnfilteredRowIterator
         public boolean isPastCurrentBlock() throws IOException
         {
             assert reader.deserializer != null;
-            long correction = reader.deserializer.bytesReadForUnconsumedData();
-            return reader.file.bytesPastMark(mark) - correction >= currentIndex().width;
+            return reader.file.bytesPastMark(mark) >= currentIndex().width;
         }
 
         public int currentBlockIdx()
@@ -603,8 +583,10 @@ public abstract class AbstractSSTableIterator implements UnfilteredRowIterator
             return (index < 0 ? -index - (reversed ? 2 : 1) : index);
         }
 
-        private int binarySearch(IndexInfo key, Comparator<IndexInfo> c, int low, int high) throws IOException {
-            while (low <= high) {
+        private int binarySearch(IndexInfo key, Comparator<IndexInfo> c, int low, int high) throws IOException
+        {
+            while (low <= high)
+            {
                 int mid = (low + high) >>> 1;
                 IndexInfo midVal = index(mid);
                 int cmp = c.compare(midVal, key);

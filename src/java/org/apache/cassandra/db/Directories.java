@@ -17,28 +17,18 @@
  */
 package org.apache.cassandra.db;
 
-import static com.google.common.collect.Sets.newHashSet;
-
 import java.io.File;
 import java.io.FileFilter;
 import java.io.IOError;
 import java.io.IOException;
-import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.SimpleFileVisitor;
-import java.nio.file.attribute.BasicFileAttributes;
 import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiFunction;
-import java.util.function.Consumer;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Predicate;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.ImmutableSet.Builder;
 import com.google.common.collect.Iterables;
 
 import org.apache.commons.lang3.StringUtils;
@@ -47,12 +37,13 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.*;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.io.FSDiskFullWriteError;
 import org.apache.cassandra.io.FSError;
 import org.apache.cassandra.io.FSWriteError;
-import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.io.sstable.*;
-import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.utils.DirectorySizeCalculator;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Pair;
 
@@ -68,13 +59,13 @@ import org.apache.cassandra.utils.Pair;
  * } </pre>
  *
  * Until v2.0, {@code <cf dir>} is just column family name.
- * Since v2.1, {@code <cf dir>} has column family ID(cfId) added to its end.
+ * Since v2.1, {@code <cf dir>} has column family ID(tableId) added to its end.
  *
  * SSTables from secondary indexes were put in the same directory as their parent.
  * Since v2.2, they have their own directory under the parent directory whose name is index name.
  * Upon startup, those secondary index files are moved to new directory when upgrading.
  *
- * For backward compatibility, Directories can use directory without cfId if exists.
+ * For backward compatibility, Directories can use directory without tableId if exists.
  *
  * In addition, more that one 'root' data directory can be specified so that
  * {@code <path_to_data_dir>} potentially represents multiple locations.
@@ -154,7 +145,8 @@ public class Directories
         {
             boolean privilege = false;
 
-            switch (action) {
+            switch (action)
+            {
                 case X:
                     privilege = file.canExecute();
                     break;
@@ -181,49 +173,49 @@ public class Directories
         }
     }
 
-    private final CFMetaData metadata;
+    private final TableMetadata metadata;
     private final DataDirectory[] paths;
     private final File[] dataPaths;
 
-    public Directories(final CFMetaData metadata)
+    public Directories(final TableMetadata metadata)
     {
         this(metadata, dataDirectories);
     }
+
+    public Directories(final TableMetadata metadata, Collection<DataDirectory> paths)
+    {
+        this(metadata, paths.toArray(new DataDirectory[paths.size()]));
+    }
+
     /**
      * Create Directories of given ColumnFamily.
      * SSTable directories are created under data_directories defined in cassandra.yaml if not exist at this time.
      *
      * @param metadata metadata of ColumnFamily
      */
-    public Directories(final CFMetaData metadata, DataDirectory[] paths)
+    public Directories(final TableMetadata metadata, DataDirectory[] paths)
     {
         this.metadata = metadata;
         this.paths = paths;
 
-        String cfId = ByteBufferUtil.bytesToHex(ByteBufferUtil.bytes(metadata.cfId));
-        int idx = metadata.cfName.indexOf(SECONDARY_INDEX_NAME_SEPARATOR);
-        String cfName = idx >= 0 ? metadata.cfName.substring(0, idx) : metadata.cfName;
-        String indexNameWithDot = idx >= 0 ? metadata.cfName.substring(idx) : null;
+        String tableId = metadata.id.toHexString();
+        int idx = metadata.name.indexOf(SECONDARY_INDEX_NAME_SEPARATOR);
+        String cfName = idx >= 0 ? metadata.name.substring(0, idx) : metadata.name;
+        String indexNameWithDot = idx >= 0 ? metadata.name.substring(idx) : null;
 
         this.dataPaths = new File[paths.length];
         // If upgraded from version less than 2.1, use existing directories
-        String oldSSTableRelativePath = join(metadata.ksName, cfName);
+        String oldSSTableRelativePath = join(metadata.keyspace, cfName);
         for (int i = 0; i < paths.length; ++i)
         {
             // check if old SSTable directory exists
             dataPaths[i] = new File(paths[i].location, oldSSTableRelativePath);
         }
-        boolean olderDirectoryExists = Iterables.any(Arrays.asList(dataPaths), new Predicate<File>()
-        {
-            public boolean apply(File file)
-            {
-                return file.exists();
-            }
-        });
+        boolean olderDirectoryExists = Iterables.any(Arrays.asList(dataPaths), File::exists);
         if (!olderDirectoryExists)
         {
             // use 2.1+ style
-            String newSSTableRelativePath = join(metadata.ksName, cfName + '-' + cfId);
+            String newSSTableRelativePath = join(metadata.keyspace, cfName + '-' + tableId);
             for (int i = 0; i < paths.length; ++i)
                 dataPaths[i] = new File(paths[i].location, newSSTableRelativePath);
         }
@@ -261,9 +253,8 @@ public class Directories
                         if (file.isDirectory())
                             return false;
 
-                        Pair<Descriptor, Component> pair = SSTable.tryComponentFromFilename(file.getParentFile(),
-                                                                                            file.getName());
-                        return pair != null && pair.left.ksname.equals(metadata.ksName) && pair.left.cfname.equals(metadata.cfName);
+                        Descriptor desc = SSTable.tryDescriptorFromFilename(file);
+                        return desc != null && desc.ksname.equals(metadata.keyspace) && desc.cfname.equals(metadata.name);
 
                     }
                 });
@@ -296,7 +287,7 @@ public class Directories
     {
         if (directory != null)
         {
-            for (DataDirectory dataDirectory : dataDirectories)
+            for (DataDirectory dataDirectory : paths)
             {
                 if (directory.getAbsolutePath().startsWith(dataDirectory.location.getAbsolutePath()))
                     return dataDirectory;
@@ -309,8 +300,9 @@ public class Directories
     {
         for (File dir : dataPaths)
         {
-            if (new File(dir, filename).exists())
-                return Descriptor.fromFilename(dir, filename).left;
+            File file = new File(dir, filename);
+            if (file.exists())
+                return Descriptor.fromFilename(file);
         }
         return null;
     }
@@ -403,7 +395,7 @@ public class Directories
 
         if (candidates.isEmpty())
             if (tooBig)
-                return null;
+                throw new FSDiskFullWriteError(new IOException("Insufficient disk space to write " + writeSize + " bytes"), "");
             else
                 throw new FSWriteError(new IOException("All configured data directories have been blacklisted as unwritable for erroring out"), "");
 
@@ -464,7 +456,7 @@ public class Directories
     public DataDirectory[] getWriteableLocations()
     {
         List<DataDirectory> nonBlacklistedDirs = new ArrayList<>();
-        for (DataDirectory dir : dataDirectories)
+        for (DataDirectory dir : paths)
         {
             if (!BlacklistedDirectories.isUnwritable(dir.location))
                 nonBlacklistedDirs.add(dir);
@@ -515,6 +507,12 @@ public class Directories
         return new File(snapshotDir, "manifest.json");
     }
 
+    public File getSnapshotSchemaFile(String snapshotName)
+    {
+        File snapshotDir = getSnapshotDirectory(getDirectoryForNewSSTables(), snapshotName);
+        return new File(snapshotDir, "schema.cql");
+    }
+
     public File getNewEphemeralSnapshotMarkerFile(String snapshotName)
     {
         File snapshotDir = new File(getWriteableLocationAsFile(1L), join(SNAPSHOT_SUBDIR, snapshotName));
@@ -554,7 +552,8 @@ public class Directories
 
         public long getAvailableSpace()
         {
-            return location.getUsableSpace();
+            long availableSpace = location.getUsableSpace() - DatabaseDescriptor.getMinFreeSpacePerDriveInBytes();
+            return availableSpace > 0 ? availableSpace : 0;
         }
 
         @Override
@@ -749,12 +748,12 @@ public class Directories
                             return false;
 
                     case FINAL:
-                        Pair<Descriptor, Component> pair = SSTable.tryComponentFromFilename(file.getParentFile(), file.getName());
+                        Pair<Descriptor, Component> pair = SSTable.tryComponentFromFilename(file);
                         if (pair == null)
                             return false;
 
                         // we are only interested in the SSTable files that belong to the specific ColumnFamily
-                        if (!pair.left.ksname.equals(metadata.ksName) || !pair.left.cfname.equals(metadata.cfName))
+                        if (!pair.left.ksname.equals(metadata.keyspace) || !pair.left.cfname.equals(metadata.name))
                             return false;
 
                         Set<Component> previous = components.get(pair.left);
@@ -762,24 +761,6 @@ public class Directories
                         {
                             previous = new HashSet<>();
                             components.put(pair.left, previous);
-                        }
-                        else if (pair.right.type == Component.Type.DIGEST)
-                        {
-                            if (pair.right != pair.left.digestComponent)
-                            {
-                                // Need to update the DIGEST component as it might be set to another
-                                // digest type as a guess. This may happen if the first component is
-                                // not the DIGEST (but the Data component for example), so the digest
-                                // type is _guessed_ from the Version.
-                                // Although the Version explicitly defines the digest type, it doesn't
-                                // seem to be true under all circumstances. Generated sstables from a
-                                // post 2.1.8 snapshot produced Digest.sha1 files although Version
-                                // defines Adler32.
-                                // TL;DR this piece of code updates the digest component to be "correct".
-                                components.remove(pair.left);
-                                Descriptor updated = pair.left.withDigestComponent(pair.right);
-                                components.put(updated, previous);
-                            }
                         }
                         previous.add(pair.right);
                         nbFiles++;
@@ -813,7 +794,6 @@ public class Directories
         }
         return snapshotSpaceMap;
     }
-
 
     public List<String> listEphemeralSnapshots()
     {
@@ -886,7 +866,7 @@ public class Directories
                 }
                 catch (FSWriteError e)
                 {
-                    if (FBUtilities.isWindows())
+                    if (FBUtilities.isWindows)
                         SnapshotDeletingTask.addFailedSnapshot(snapshotDir);
                     else
                         throw e;
@@ -923,12 +903,25 @@ public class Directories
         return result;
     }
 
+    /**
+     * @return Raw size on disk for all directories
+     */
+    public long getRawDiretoriesSize()
+    {
+        long totalAllocatedSize = 0L;
+
+        for (File path : dataPaths)
+            totalAllocatedSize += FileUtils.folderSize(path);
+
+        return totalAllocatedSize;
+    }
+
     public long getTrueAllocatedSizeIn(File input)
     {
         if (!input.isDirectory())
             return 0;
 
-        TrueFilesSizeVisitor visitor = new TrueFilesSizeVisitor();
+        SSTableSizeSummer visitor = new SSTableSizeSummer(input, sstableLister(Directories.OnTxnErr.THROW).listFiles());
         try
         {
             Files.walkFileTree(input.toPath(), visitor);
@@ -941,11 +934,17 @@ public class Directories
         return visitor.getAllocatedSize();
     }
 
-    // Recursively finds all the sub directories in the KS directory.
     public static List<File> getKSChildDirectories(String ksName)
     {
+        return getKSChildDirectories(ksName, dataDirectories);
+
+    }
+
+    // Recursively finds all the sub directories in the KS directory.
+    public static List<File> getKSChildDirectories(String ksName, DataDirectory[] directories)
+    {
         List<File> result = new ArrayList<>();
-        for (DataDirectory dataDirectory : dataDirectories)
+        for (DataDirectory dataDirectory : directories)
         {
             File ksDir = new File(dataDirectory.location, ksName);
             File[] cfDirs = ksDir.listFiles();
@@ -1005,53 +1004,25 @@ public class Directories
         for (int i = 0; i < locations.length; ++i)
             dataDirectories[i] = new DataDirectory(new File(locations[i]));
     }
-    
-    private class TrueFilesSizeVisitor extends SimpleFileVisitor<Path>
+
+    private class SSTableSizeSummer extends DirectorySizeCalculator
     {
-        private final AtomicLong size = new AtomicLong(0);
-        private final Set<String> visited = newHashSet(); //count each file only once
-        private final Set<String> alive;
-
-        TrueFilesSizeVisitor()
+        private final HashSet<File> toSkip;
+        SSTableSizeSummer(File path, List<File> files)
         {
-            super();
-            Builder<String> builder = ImmutableSet.builder();
-            for (File file : sstableLister(Directories.OnTxnErr.THROW).listFiles())
-                builder.add(file.getName());
-            alive = builder.build();
-        }
-
-        private boolean isAcceptable(Path file)
-        {
-            String fileName = file.toFile().getName();
-            Pair<Descriptor, Component> pair = SSTable.tryComponentFromFilename(file.getParent().toFile(), fileName);
-            return pair != null
-                    && pair.left.ksname.equals(metadata.ksName)
-                    && pair.left.cfname.equals(metadata.cfName)
-                    && !visited.contains(fileName)
-                    && !alive.contains(fileName);
+            super(path);
+            toSkip = new HashSet<>(files);
         }
 
         @Override
-        public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException
+        public boolean isAcceptable(Path path)
         {
-            if (isAcceptable(file))
-            {
-                size.addAndGet(attrs.size());
-                visited.add(file.toFile().getName());
-            }
-            return FileVisitResult.CONTINUE;
-        }
-
-        @Override
-        public FileVisitResult visitFileFailed(Path file, IOException exc) throws IOException 
-        {
-            return FileVisitResult.CONTINUE;
-        }
-        
-        public long getAllocatedSize()
-        {
-            return size.get();
+            File file = path.toFile();
+            Descriptor desc = SSTable.tryDescriptorFromFilename(file);
+            return desc != null
+                && desc.ksname.equals(metadata.keyspace)
+                && desc.cfname.equals(metadata.name)
+                && !toSkip.contains(file);
         }
     }
 }

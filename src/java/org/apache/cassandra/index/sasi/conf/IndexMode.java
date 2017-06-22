@@ -22,7 +22,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.index.sasi.analyzer.AbstractAnalyzer;
 import org.apache.cassandra.index.sasi.analyzer.NoOpAnalyzer;
 import org.apache.cassandra.index.sasi.analyzer.NonTokenizingAnalyzer;
@@ -110,12 +110,12 @@ public class IndexMode
         }
     }
 
-    public static IndexMode getMode(ColumnDefinition column, Optional<IndexMetadata> config) throws ConfigurationException
+    public static IndexMode getMode(ColumnMetadata column, Optional<IndexMetadata> config) throws ConfigurationException
     {
         return getMode(column, config.isPresent() ? config.get().options : null);
     }
 
-    public static IndexMode getMode(ColumnDefinition column, Map<String, String> indexOptions) throws ConfigurationException
+    public static IndexMode getMode(ColumnMetadata column, Map<String, String> indexOptions) throws ConfigurationException
     {
         if (indexOptions == null || indexOptions.isEmpty())
             return IndexMode.NOT_INDEXED;
@@ -141,11 +141,11 @@ public class IndexMode
             {
                 analyzerClass = Class.forName(indexOptions.get(INDEX_ANALYZER_CLASS_OPTION));
                 isAnalyzed = indexOptions.get(INDEX_ANALYZED_OPTION) == null
-                              ? true : Boolean.valueOf(indexOptions.get(INDEX_ANALYZED_OPTION));
+                              ? true : Boolean.parseBoolean(indexOptions.get(INDEX_ANALYZED_OPTION));
             }
             else if (indexOptions.get(INDEX_ANALYZED_OPTION) != null)
             {
-                isAnalyzed = Boolean.valueOf(indexOptions.get(INDEX_ANALYZED_OPTION));
+                isAnalyzed = Boolean.parseBoolean(indexOptions.get(INDEX_ANALYZED_OPTION));
             }
         }
         catch (ClassNotFoundException e)
@@ -163,7 +163,7 @@ public class IndexMode
 
             isLiteral = literalOption == null
                             ? (validator instanceof UTF8Type || validator instanceof AsciiType)
-                            : Boolean.valueOf(literalOption);
+                            : Boolean.parseBoolean(literalOption);
         }
         catch (Exception e)
         {

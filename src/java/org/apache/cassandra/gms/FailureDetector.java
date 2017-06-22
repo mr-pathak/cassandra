@@ -17,6 +17,9 @@
  */
 package org.apache.cassandra.gms;
 
+import java.nio.file.Files;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.Path;
 import java.io.*;
 import java.lang.management.ManagementFactory;
 import java.net.InetAddress;
@@ -36,6 +39,7 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.utils.Clock;
 import org.apache.cassandra.utils.FBUtilities;
 
 /**
@@ -52,7 +56,7 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
     private static final int DEBUG_PERCENTAGE = 80; // if the phi is larger than this percentage of the max, log a debug message
     private static final long DEFAULT_MAX_PAUSE = 5000L * 1000000L; // 5 seconds
     private static final long MAX_LOCAL_PAUSE_IN_NANOS = getMaxLocalPause();
-    private long lastInterpret = System.nanoTime();
+    private long lastInterpret = Clock.instance.nanoTime();
     private long lastPause = 0L;
 
     private static long getMaxLocalPause()
@@ -214,15 +218,18 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
      */
     public void dumpInterArrivalTimes()
     {
-        File file = FileUtils.createTempFile("failuredetector-", ".dat");
+        Path path = null;
+        try {
+            path = Files.createTempFile("failuredetector-", ".dat");
 
-        try (OutputStream os = new BufferedOutputStream(new FileOutputStream(file, true)))
-        {
-            os.write(toString().getBytes());
+            try (OutputStream os = new BufferedOutputStream(Files.newOutputStream(path, StandardOpenOption.APPEND)))
+            {
+                os.write(toString().getBytes());
+            }
         }
         catch (IOException e)
         {
-            throw new FSWriteError(e, file);
+            throw new FSWriteError(e, (path == null) ? null : path.toFile());
         }
     }
 
@@ -252,7 +259,7 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
 
     public void report(InetAddress ep)
     {
-        long now = System.nanoTime();
+        long now = Clock.instance.nanoTime();
         ArrivalWindow heartbeatWindow = arrivalSamples.get(ep);
         if (heartbeatWindow == null)
         {
@@ -269,7 +276,7 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
         }
 
         if (logger.isTraceEnabled() && heartbeatWindow != null)
-            logger.trace("Average for {} is {}", ep, heartbeatWindow.mean());
+            logger.trace("Average for {} is {}ns", ep, heartbeatWindow.mean());
     }
 
     public void interpret(InetAddress ep)
@@ -279,16 +286,16 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
         {
             return;
         }
-        long now = System.nanoTime();
+        long now = Clock.instance.nanoTime();
         long diff = now - lastInterpret;
         lastInterpret = now;
         if (diff > MAX_LOCAL_PAUSE_IN_NANOS)
         {
-            logger.warn("Not marking nodes down due to local pause of {} > {}", diff, MAX_LOCAL_PAUSE_IN_NANOS);
+            logger.warn("Not marking nodes down due to local pause of {}ns > {}ns", diff, MAX_LOCAL_PAUSE_IN_NANOS);
             lastPause = now;
             return;
         }
-        if (System.nanoTime() - lastPause < MAX_LOCAL_PAUSE_IN_NANOS)
+        if (Clock.instance.nanoTime() - lastPause < MAX_LOCAL_PAUSE_IN_NANOS)
         {
             logger.debug("Still not marking nodes down due to local pause");
             return;
@@ -300,7 +307,7 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
         if (PHI_FACTOR * phi > getPhiConvictThreshold())
         {
             if (logger.isTraceEnabled())
-                logger.trace("Node {} phi {} > {}; intervals: {} mean: {}", new Object[]{ep, PHI_FACTOR * phi, getPhiConvictThreshold(), hbWnd, hbWnd.mean()});
+                logger.trace("Node {} phi {} > {}; intervals: {} mean: {}ns", new Object[]{ep, PHI_FACTOR * phi, getPhiConvictThreshold(), hbWnd, hbWnd.mean()});
             for (IFailureDetectionEventListener listener : fdEvntListeners)
             {
                 listener.convict(ep, phi);
@@ -313,7 +320,7 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
         else if (logger.isTraceEnabled())
         {
             logger.trace("PHI for {} : {}", ep, phi);
-            logger.trace("mean for {} : {}", ep, hbWnd.mean());
+            logger.trace("mean for {} : {}ns", ep, hbWnd.mean());
         }
     }
 
@@ -350,7 +357,7 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
         for (InetAddress ep : eps)
         {
             ArrivalWindow hWnd = arrivalSamples.get(ep);
-            sb.append(ep + " : ");
+            sb.append(ep).append(" : ");
             sb.append(hWnd);
             sb.append(System.getProperty("line.separator"));
         }
@@ -449,11 +456,11 @@ class ArrivalWindow
             if (interArrivalTime <= MAX_INTERVAL_IN_NANO)
             {
                 arrivalIntervals.add(interArrivalTime);
-                logger.trace("Reporting interval time of {} for {}", interArrivalTime, ep);
+                logger.trace("Reporting interval time of {}ns for {}", interArrivalTime, ep);
             }
             else
             {
-                logger.debug("Ignoring interval time of {} for {}", interArrivalTime, ep);
+                logger.debug("Ignoring interval time of {}ns for {}", interArrivalTime, ep);
             }
         }
         else

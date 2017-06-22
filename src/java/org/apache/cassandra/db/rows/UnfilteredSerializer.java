@@ -22,11 +22,15 @@ import java.io.IOException;
 import com.google.common.collect.Collections2;
 
 import net.nicoulaj.compilecommand.annotations.Inline;
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.rows.Row.Deletion;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.io.util.FileDataInput;
+import org.apache.cassandra.utils.SearchIterator;
+import org.apache.cassandra.utils.WrappedException;
 
 /**
  * Serialize/deserialize a single Unfiltered (both on-wire and on-disk).
@@ -48,7 +52,7 @@ import org.apache.cassandra.io.util.DataOutputPlus;
  *     where:
  *     <ul>
  *       <li>{@code <clustering>} is the row clustering as serialized by
- *           {@link Clustering.serializer} (note that static row are an
+ *           {@link org.apache.cassandra.db.Clustering.Serializer} (note that static row are an
  *           exception and don't have this). </li>
  *       <li>{@code <sizes>} are the sizes of the whole unfiltered on disk and
  *           of the previous unfiltered. This is only present for sstables and
@@ -60,7 +64,7 @@ import org.apache.cassandra.io.util.DataOutputPlus;
  *           by the flags and if present, it conists of both the deletion
  *           timestamp and local deletion time.</li>
  *       <li>{@code <columns>} are the columns present in the row  encoded by
- *           {@link Columns.serializer#serializeSubset}. It is absent if the row
+ *           {@link org.apache.cassandra.db.Columns.Serializer#serializeSubset}. It is absent if the row
  *           contains all the columns of the {@code SerializationHeader} (which
  *           is then indicated by a flag). </li>
  *       <li>{@code <columns_data>} is the data for each of the column present
@@ -80,7 +84,7 @@ import org.apache.cassandra.io.util.DataOutputPlus;
  *   </li>
  *   <li>
  *     {@code <marker>} is {@code <bound><deletion>} where {@code <bound>} is
- *     the marker bound as serialized by {@link ClusteringBoundOrBoundary.serializer}
+ *     the marker bound as serialized by {@link org.apache.cassandra.db.ClusteringBoundOrBoundary.Serializer}
  *     and {@code <deletion>} is the marker deletion time.
  *   </li>
  * </ul>
@@ -180,8 +184,7 @@ public class UnfilteredSerializer
 
         if (header.isForSSTable())
         {
-            DataOutputBuffer dob = DataOutputBuffer.RECYCLER.get();
-            try
+            try (DataOutputBuffer dob = DataOutputBuffer.scratchBuffer.get())
             {
                 serializeRowBody(row, flags, header, dob);
 
@@ -189,11 +192,7 @@ public class UnfilteredSerializer
                 // We write the size of the previous unfiltered to make reverse queries more efficient (and simpler).
                 // This is currently not used however and using it is tbd.
                 out.writeUnsignedVInt(previousUnfilteredSize);
-                out.write(dob.buffer());
-            }
-            finally
-            {
-                dob.recycle();
+                out.write(dob.getData(), 0, dob.getLength());
             }
         }
         else
@@ -225,16 +224,42 @@ public class UnfilteredSerializer
         if ((flags & HAS_ALL_COLUMNS) == 0)
             Columns.serializer.serializeSubset(Collections2.transform(row, ColumnData::column), headerColumns, out);
 
-        for (ColumnData data : row)
+        SearchIterator<ColumnMetadata, ColumnMetadata> si = headerColumns.iterator();
+
+        try
         {
-            if (data.column.isSimple())
-                Cell.serializer.serialize((Cell) data, out, pkLiveness, header);
-            else
-                writeComplexColumn((ComplexColumnData) data, (flags & HAS_COMPLEX_DELETION) != 0, pkLiveness, header, out);
+            row.apply(cd -> {
+                // We can obtain the column for data directly from data.column(). However, if the cell/complex data
+                // originates from a sstable, the column we'll get will have the type used when the sstable was serialized,
+                // and if that type have been recently altered, that may not be the type we want to serialize the column
+                // with. So we use the ColumnMetadata from the "header" which is "current". Also see #11810 for what
+                // happens if we don't do that.
+                ColumnMetadata column = si.next(cd.column());
+                assert column != null : cd.column.toString();
+
+                try
+                {
+                    if (cd.column.isSimple())
+                        Cell.serializer.serialize((Cell) cd, column, out, pkLiveness, header);
+                    else
+                        writeComplexColumn((ComplexColumnData) cd, column, (flags & HAS_COMPLEX_DELETION) != 0, pkLiveness, header, out);
+                }
+                catch (IOException e)
+                {
+                    throw new WrappedException(e);
+                }
+            }, false);
+        }
+        catch (WrappedException e)
+        {
+            if (e.getCause() instanceof IOException)
+                throw (IOException) e.getCause();
+
+            throw e;
         }
     }
 
-    private void writeComplexColumn(ComplexColumnData data, boolean hasComplexDeletion, LivenessInfo rowLiveness, SerializationHeader header, DataOutputPlus out)
+    private void writeComplexColumn(ComplexColumnData data, ColumnMetadata column, boolean hasComplexDeletion, LivenessInfo rowLiveness, SerializationHeader header, DataOutputPlus out)
     throws IOException
     {
         if (hasComplexDeletion)
@@ -242,7 +267,7 @@ public class UnfilteredSerializer
 
         out.writeUnsignedVInt(data.cellsCount());
         for (Cell cell : data)
-            Cell.serializer.serialize(cell, out, rowLiveness, header);
+            Cell.serializer.serialize(cell, column, out, rowLiveness, header);
     }
 
     private void serialize(RangeTombstoneMarker marker, SerializationHeader header, DataOutputPlus out, long previousUnfilteredSize, int version)
@@ -322,18 +347,22 @@ public class UnfilteredSerializer
         if (!hasAllColumns)
             size += Columns.serializer.serializedSubsetSize(Collections2.transform(row, ColumnData::column), header.columns(isStatic));
 
+        SearchIterator<ColumnMetadata, ColumnMetadata> si = headerColumns.iterator();
         for (ColumnData data : row)
         {
+            ColumnMetadata column = si.next(data.column());
+            assert column != null;
+
             if (data.column.isSimple())
-                size += Cell.serializer.serializedSize((Cell) data, pkLiveness, header);
+                size += Cell.serializer.serializedSize((Cell) data, column, pkLiveness, header);
             else
-                size += sizeOfComplexColumn((ComplexColumnData) data, hasComplexDeletion, pkLiveness, header);
+                size += sizeOfComplexColumn((ComplexColumnData) data, column, hasComplexDeletion, pkLiveness, header);
         }
 
         return size;
     }
 
-    private long sizeOfComplexColumn(ComplexColumnData data, boolean hasComplexDeletion, LivenessInfo rowLiveness, SerializationHeader header)
+    private long sizeOfComplexColumn(ComplexColumnData data, ColumnMetadata column, boolean hasComplexDeletion, LivenessInfo rowLiveness, SerializationHeader header)
     {
         long size = 0;
 
@@ -342,7 +371,7 @@ public class UnfilteredSerializer
 
         size += TypeSizes.sizeofUnsignedVInt(data.cellsCount());
         for (Cell cell : data)
-            size += Cell.serializer.serializedSize(cell, rowLiveness, header);
+            size += Cell.serializer.serializedSize(cell, column, rowLiveness, header);
 
         return size;
     }
@@ -384,7 +413,42 @@ public class UnfilteredSerializer
         return 1;
     }
 
+    /**
+     * Deserialize an {@link Unfiltered} from the provided input.
+     *
+     * @param in the input from which to deserialize.
+     * @param header serialization header corresponding to the serialized data.
+     * @param helper the helper to use for deserialization.
+     * @param builder a row builder, passed here so we don't allocate a new one for every new row.
+     * @return the deserialized {@link Unfiltered} or {@code null} if we've read the end of a partition. This method is
+     * guaranteed to never return empty rows.
+     */
     public Unfiltered deserialize(DataInputPlus in, SerializationHeader header, SerializationHelper helper, Row.Builder builder)
+    throws IOException
+    {
+        while (true)
+        {
+            Unfiltered unfiltered = deserializeOne(in, header, helper, builder);
+            if (unfiltered == null)
+                return null;
+
+            // Skip empty rows, see deserializeOne javadoc
+            if (!unfiltered.isEmpty())
+                return unfiltered;
+        }
+    }
+
+    /**
+     * Deserialize a single {@link Unfiltered} from the provided input.
+     * <p>
+     * <b>WARNING:</b> this can return an empty row because it's possible there is a row serialized, but that row only
+     * contains data for dropped columns, see CASSANDRA-13337. But as most code expect rows to not be empty, this isn't
+     * meant to be exposed publicly.
+     *
+     * But as {@link UnfilteredRowIterator} should not return empty
+     * rows, this mean consumer of this method should make sure to skip said empty rows.
+     */
+    private Unfiltered deserializeOne(DataInputPlus in, SerializationHeader header, SerializationHelper helper, Row.Builder builder)
     throws IOException
     {
         // It wouldn't be wrong per-se to use an unsorted builder, but it would be inefficient so make sure we don't do it by mistake
@@ -403,9 +467,64 @@ public class UnfilteredSerializer
         }
         else
         {
-            assert !isStatic(extendedFlags); // deserializeStaticRow should be used for that.
+            // deserializeStaticRow should be used for that.
+            if (isStatic(extendedFlags))
+                throw new IOException("Corrupt flags value for unfiltered partition (isStatic flag set): " + flags);
+
             builder.newRow(Clustering.serializer.deserialize(in, helper.version, header.clusteringTypes()));
             return deserializeRowBody(in, header, helper, flags, extendedFlags, builder);
+        }
+    }
+
+    public Unfiltered deserializeTombstonesOnly(FileDataInput in, SerializationHeader header, SerializationHelper helper)
+    throws IOException
+    {
+        while (true)
+        {
+            int flags = in.readUnsignedByte();
+            if (isEndOfPartition(flags))
+                return null;
+
+            int extendedFlags = readExtendedFlags(in, flags);
+
+            if (kind(flags) == Unfiltered.Kind.RANGE_TOMBSTONE_MARKER)
+            {
+                ClusteringBoundOrBoundary bound = ClusteringBoundOrBoundary.serializer.deserialize(in, helper.version, header.clusteringTypes());
+                return deserializeMarkerBody(in, header, bound);
+            }
+            else
+            {
+                assert !isStatic(extendedFlags); // deserializeStaticRow should be used for that.
+                if ((flags & HAS_DELETION) != 0)
+                {
+                    assert header.isForSSTable();
+                    boolean hasTimestamp = (flags & HAS_TIMESTAMP) != 0;
+                    boolean hasTTL = (flags & HAS_TTL) != 0;
+                    boolean deletionIsShadowable = (extendedFlags & HAS_SHADOWABLE_DELETION) != 0;
+                    Clustering clustering = Clustering.serializer.deserialize(in, helper.version, header.clusteringTypes());
+                    long nextPosition = in.readUnsignedVInt() + in.getFilePointer();
+                    in.readUnsignedVInt(); // skip previous unfiltered size
+                    if (hasTimestamp)
+                    {
+                        header.readTimestamp(in);
+                        if (hasTTL)
+                        {
+                            header.readTTL(in);
+                            header.readLocalDeletionTime(in);
+                        }
+                    }
+
+                    Deletion deletion = new Row.Deletion(header.readDeletionTime(in), deletionIsShadowable);
+                    in.seek(nextPosition);
+                    return BTreeRow.emptyDeletedRow(clustering, deletion);
+                }
+                else
+                {
+                    Clustering.serializer.skip(in, helper.version, header.clusteringTypes());
+                    skipRowBody(in);
+                    // Continue with next item.
+                }
+            }
         }
     }
 
@@ -473,12 +592,31 @@ public class UnfilteredSerializer
             builder.addRowDeletion(hasDeletion ? new Row.Deletion(header.readDeletionTime(in), deletionIsShadowable) : Row.Deletion.LIVE);
 
             Columns columns = hasAllColumns ? headerColumns : Columns.serializer.deserializeSubset(headerColumns, in);
-            for (ColumnDefinition column : columns)
+
+            final LivenessInfo livenessInfo = rowLiveness;
+
+            try
             {
-                if (column.isSimple())
-                    readSimpleColumn(column, in, header, helper, builder, rowLiveness);
-                else
-                    readComplexColumn(column, in, header, helper, hasComplexDeletion, builder, rowLiveness);
+                columns.apply(column -> {
+                    try
+                    {
+                        if (column.isSimple())
+                            readSimpleColumn(column, in, header, helper, builder, livenessInfo);
+                        else
+                            readComplexColumn(column, in, header, helper, hasComplexDeletion, builder, livenessInfo);
+                    }
+                    catch (IOException e)
+                    {
+                        throw new WrappedException(e);
+                    }
+                }, false);
+            }
+            catch (WrappedException e)
+            {
+                if (e.getCause() instanceof IOException)
+                    throw (IOException) e.getCause();
+
+                throw e;
             }
 
             return builder.build();
@@ -493,7 +631,7 @@ public class UnfilteredSerializer
         }
     }
 
-    private void readSimpleColumn(ColumnDefinition column, DataInputPlus in, SerializationHeader header, SerializationHelper helper, Row.Builder builder, LivenessInfo rowLiveness)
+    private void readSimpleColumn(ColumnMetadata column, DataInputPlus in, SerializationHeader header, SerializationHelper helper, Row.Builder builder, LivenessInfo rowLiveness)
     throws IOException
     {
         if (helper.includes(column))
@@ -508,7 +646,7 @@ public class UnfilteredSerializer
         }
     }
 
-    private void readComplexColumn(ColumnDefinition column, DataInputPlus in, SerializationHeader header, SerializationHelper helper, boolean hasComplexDeletion, Row.Builder builder, LivenessInfo rowLiveness)
+    private void readComplexColumn(ColumnMetadata column, DataInputPlus in, SerializationHeader header, SerializationHelper helper, boolean hasComplexDeletion, Row.Builder builder, LivenessInfo rowLiveness)
     throws IOException
     {
         if (helper.includes(column))
@@ -558,7 +696,7 @@ public class UnfilteredSerializer
         in.skipBytesFully(markerSize);
     }
 
-    private void skipComplexColumn(DataInputPlus in, ColumnDefinition column, SerializationHeader header, boolean hasComplexDeletion)
+    private void skipComplexColumn(DataInputPlus in, ColumnMetadata column, SerializationHeader header, boolean hasComplexDeletion)
     throws IOException
     {
         if (hasComplexDeletion)

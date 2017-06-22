@@ -32,8 +32,8 @@ import org.junit.Assert;
 import org.junit.BeforeClass;
 
 import org.apache.cassandra.SchemaLoader;
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.RowUpdateBuilder;
 import org.apache.cassandra.schema.KeyspaceParams;
@@ -51,7 +51,7 @@ public abstract class AlteredHints
 
     private static Mutation createMutation(int index, long timestamp)
     {
-        CFMetaData table = Schema.instance.getCFMetaData(KEYSPACE, TABLE);
+        TableMetadata table = Schema.instance.getTableMetadata(KEYSPACE, TABLE);
         return new RowUpdateBuilder(table, timestamp, bytes(index))
                .clustering(bytes(index))
                .add("val", bytes(index))
@@ -107,9 +107,11 @@ public abstract class AlteredHints
         {
             Assert.assertTrue(looksLegit(reader.getInput()));
             List<Hint> deserialized = new ArrayList<>(hintNum);
+            List<InputPosition> pagePositions = new ArrayList<>(hintNum);
 
             for (HintsReader.Page page: reader)
             {
+                pagePositions.add(page.position);
                 Iterator<Hint> iterator = page.hintsIterator();
                 while (iterator.hasNext())
                 {
@@ -123,6 +125,21 @@ public abstract class AlteredHints
             {
                 HintsTestUtil.assertHintsEqual(expected, deserialized.get(hintNum));
                 hintNum++;
+            }
+
+            // explicitely seek to each page by iterating collected page positions and check if hints still match as expected
+            int hintOffset = 0;
+            for (InputPosition pos : pagePositions)
+            {
+                reader.seek(pos);
+                HintsReader.Page page = reader.iterator().next();
+                Iterator<Hint> iterator = page.hintsIterator();
+                while (iterator.hasNext())
+                {
+                    Hint seekedHint = iterator.next();
+                    HintsTestUtil.assertHintsEqual(hints.get(hintOffset), seekedHint);
+                    hintOffset++;
+                }
             }
         }
     }

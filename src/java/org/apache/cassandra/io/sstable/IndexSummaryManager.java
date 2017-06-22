@@ -40,6 +40,7 @@ import org.apache.cassandra.db.lifecycle.View;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.WrappedRunnable;
 
@@ -195,10 +196,10 @@ public class IndexSummaryManager implements IndexSummaryManagerMBean
      * compacting.
      */
     @SuppressWarnings("resource")
-    private Pair<List<SSTableReader>, Map<UUID, LifecycleTransaction>> getCompactingAndNonCompactingSSTables()
+    private Pair<List<SSTableReader>, Map<TableId, LifecycleTransaction>> getCompactingAndNonCompactingSSTables()
     {
         List<SSTableReader> allCompacting = new ArrayList<>();
-        Map<UUID, LifecycleTransaction> allNonCompacting = new HashMap<>();
+        Map<TableId, LifecycleTransaction> allNonCompacting = new HashMap<>();
         for (Keyspace ks : Keyspace.all())
         {
             for (ColumnFamilyStore cfStore: ks.getColumnFamilyStores())
@@ -208,12 +209,12 @@ public class IndexSummaryManager implements IndexSummaryManagerMBean
                 do
                 {
                     View view = cfStore.getTracker().getView();
-                    allSSTables = ImmutableSet.copyOf(view.sstables(SSTableSet.CANONICAL));
+                    allSSTables = ImmutableSet.copyOf(view.select(SSTableSet.CANONICAL));
                     nonCompacting = ImmutableSet.copyOf(view.getUncompacting(allSSTables));
                 }
                 while (null == (txn = cfStore.getTracker().tryModify(nonCompacting, OperationType.UNKNOWN)));
 
-                allNonCompacting.put(cfStore.metadata.cfId, txn);
+                allNonCompacting.put(cfStore.metadata.id, txn);
                 allCompacting.addAll(Sets.difference(allSSTables, nonCompacting));
             }
         }
@@ -222,10 +223,12 @@ public class IndexSummaryManager implements IndexSummaryManagerMBean
 
     public void redistributeSummaries() throws IOException
     {
-        Pair<List<SSTableReader>, Map<UUID, LifecycleTransaction>> compactingAndNonCompacting = getCompactingAndNonCompactingSSTables();
+        Pair<List<SSTableReader>, Map<TableId, LifecycleTransaction>> compactingAndNonCompacting = getCompactingAndNonCompactingSSTables();
         try
         {
-            redistributeSummaries(compactingAndNonCompacting.left, compactingAndNonCompacting.right, this.memoryPoolBytes);
+            redistributeSummaries(new IndexSummaryRedistribution(compactingAndNonCompacting.left,
+                                                                 compactingAndNonCompacting.right,
+                                                                 this.memoryPoolBytes));
         }
         finally
         {
@@ -237,14 +240,14 @@ public class IndexSummaryManager implements IndexSummaryManagerMBean
     /**
      * Attempts to fairly distribute a fixed pool of memory for index summaries across a set of SSTables based on
      * their recent read rates.
-     * @param transactions containing the sstables we are to redistribute the memory pool across
-     * @param memoryPoolBytes a size (in bytes) that the total index summary space usage should stay close to or
-     *                        under, if possible
+     * @param redistribution encapsulating the transactions containing the sstables we are to redistribute the
+     *                       memory pool across and a size (in bytes) that the total index summary space usage
+     *                       should stay close to or under, if possible
      * @return a list of new SSTableReader instances
      */
     @VisibleForTesting
-    public static List<SSTableReader> redistributeSummaries(List<SSTableReader> compacting, Map<UUID, LifecycleTransaction> transactions, long memoryPoolBytes) throws IOException
+    public static List<SSTableReader> redistributeSummaries(IndexSummaryRedistribution redistribution) throws IOException
     {
-        return CompactionManager.instance.runIndexSummaryRedistribution(new IndexSummaryRedistribution(compacting, transactions, memoryPoolBytes));
+        return CompactionManager.instance.runIndexSummaryRedistribution(redistribution);
     }
 }

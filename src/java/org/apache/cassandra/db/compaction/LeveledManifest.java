@@ -23,13 +23,14 @@ import java.util.*;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Predicate;
 import com.google.common.base.Predicates;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.ImmutableSortedSet;
 import com.google.common.collect.Iterables;
-import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import com.google.common.primitives.Ints;
 
 import org.apache.cassandra.db.PartitionPosition;
+import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -70,12 +71,14 @@ public class LeveledManifest
     private final long maxSSTableSizeInBytes;
     private final SizeTieredCompactionStrategyOptions options;
     private final int [] compactionCounter;
+    private final int levelFanoutSize;
 
-    LeveledManifest(ColumnFamilyStore cfs, int maxSSTableSizeInMB, SizeTieredCompactionStrategyOptions options)
+    LeveledManifest(ColumnFamilyStore cfs, int maxSSTableSizeInMB, int fanoutSize, SizeTieredCompactionStrategyOptions options)
     {
         this.cfs = cfs;
         this.maxSSTableSizeInBytes = maxSSTableSizeInMB * 1024L * 1024L;
         this.options = options;
+        this.levelFanoutSize = fanoutSize;
 
         generations = new List[MAX_LEVEL_COUNT];
         lastCompactedKeys = new PartitionPosition[MAX_LEVEL_COUNT];
@@ -87,14 +90,14 @@ public class LeveledManifest
         compactionCounter = new int[MAX_LEVEL_COUNT];
     }
 
-    public static LeveledManifest create(ColumnFamilyStore cfs, int maxSSTableSize, List<SSTableReader> sstables)
+    public static LeveledManifest create(ColumnFamilyStore cfs, int maxSSTableSize, int fanoutSize, List<SSTableReader> sstables)
     {
-        return create(cfs, maxSSTableSize, sstables, new SizeTieredCompactionStrategyOptions());
+        return create(cfs, maxSSTableSize, fanoutSize, sstables, new SizeTieredCompactionStrategyOptions());
     }
 
-    public static LeveledManifest create(ColumnFamilyStore cfs, int maxSSTableSize, Iterable<SSTableReader> sstables, SizeTieredCompactionStrategyOptions options)
+    public static LeveledManifest create(ColumnFamilyStore cfs, int maxSSTableSize, int fanoutSize, Iterable<SSTableReader> sstables, SizeTieredCompactionStrategyOptions options)
     {
-        LeveledManifest manifest = new LeveledManifest(cfs, maxSSTableSize, options);
+        LeveledManifest manifest = new LeveledManifest(cfs, maxSSTableSize, fanoutSize, options);
 
         // ensure all SSTables are in the manifest
         for (SSTableReader ssTableReader : sstables)
@@ -105,7 +108,36 @@ public class LeveledManifest
         {
             manifest.repairOverlappingSSTables(i);
         }
+        manifest.calculateLastCompactedKeys();
         return manifest;
+    }
+
+    /**
+     * If we want to start compaction in level n, find the newest (by modification time) file in level n+1
+     * and use its last token for last compacted key in level n;
+     */
+    public void calculateLastCompactedKeys()
+    {
+        for (int i = 0; i < generations.length - 1; i++)
+        {
+            // this level is empty
+            if (generations[i + 1].isEmpty())
+                continue;
+
+            SSTableReader sstableWithMaxModificationTime = null;
+            long maxModificationTime = Long.MIN_VALUE;
+            for (SSTableReader ssTableReader : generations[i + 1])
+            {
+                long modificationTime = ssTableReader.getCreationTimeFor(Component.DATA);
+                if (modificationTime >= maxModificationTime)
+                {
+                    sstableWithMaxModificationTime = ssTableReader;
+                    maxModificationTime = modificationTime;
+                }
+            }
+
+            lastCompactedKeys[i] = sstableWithMaxModificationTime.last;
+        }
     }
 
     public synchronized void add(SSTableReader reader)
@@ -180,9 +212,9 @@ public class LeveledManifest
         {
             if (previous != null && current.first.compareTo(previous.last) <= 0)
             {
-                logger.warn(String.format("At level %d, %s [%s, %s] overlaps %s [%s, %s].  This could be caused by a bug in Cassandra 1.1.0 .. 1.1.3 or due to the fact that you have dropped sstables from another node into the data directory. " +
-                                          "Sending back to L0.  If you didn't drop in sstables, and have not yet run scrub, you should do so since you may also have rows out-of-order within an sstable",
-                                          level, previous, previous.first, previous.last, current, current.first, current.last));
+                logger.warn("At level {}, {} [{}, {}] overlaps {} [{}, {}].  This could be caused by a bug in Cassandra 1.1.0 .. 1.1.3 or due to the fact that you have dropped sstables from another node into the data directory. " +
+                            "Sending back to L0.  If you didn't drop in sstables, and have not yet run scrub, you should do so since you may also have rows out-of-order within an sstable",
+                            level, previous, previous.first, previous.last, current, current.first, current.last);
                 outOfOrderSSTables.add(current);
             }
             else
@@ -253,11 +285,16 @@ public class LeveledManifest
         return builder.toString();
     }
 
-    public static long maxBytesForLevel(int level, long maxSSTableSizeInBytes)
+    public long maxBytesForLevel(int level, long maxSSTableSizeInBytes)
+    {
+        return maxBytesForLevel(level, levelFanoutSize, maxSSTableSizeInBytes);
+    }
+
+    public static long maxBytesForLevel(int level, int levelFanoutSize, long maxSSTableSizeInBytes)
     {
         if (level == 0)
             return 4L * maxSSTableSizeInBytes;
-        double bytes = Math.pow(10, level) * maxSSTableSizeInBytes;
+        double bytes = Math.pow(levelFanoutSize, level) * maxSSTableSizeInBytes;
         if (bytes > Long.MAX_VALUE)
             throw new RuntimeException("At most " + Long.MAX_VALUE + " bytes may be in a compaction level; your maxSSTableSize must be absurdly high to compute " + bytes);
         return (long) bytes;
@@ -488,6 +525,16 @@ public class LeveledManifest
         assert level >= 0 : reader + " not present in manifest: "+level;
         generations[level].remove(reader);
         return level;
+    }
+
+    public synchronized Set<SSTableReader> getSSTables()
+    {
+        ImmutableSet.Builder<SSTableReader> builder = ImmutableSet.builder();
+        for (List<SSTableReader> sstables : generations)
+        {
+            builder.addAll(sstables);
+        }
+        return builder.build();
     }
 
     private static Set<SSTableReader> overlapping(Collection<SSTableReader> candidates, Iterable<SSTableReader> others)
@@ -744,6 +791,13 @@ public class LeveledManifest
             // If there is 1 byte over TBL - (MBL * 1.001), there is still a task left, so we need to round up.
             estimated[i] = (long)Math.ceil((double)Math.max(0L, SSTableReader.getTotalBytes(sstables) - (long)(maxBytesForLevel(i, maxSSTableSizeInBytes) * 1.001)) / (double)maxSSTableSizeInBytes);
             tasks += estimated[i];
+        }
+
+        if (!DatabaseDescriptor.getDisableSTCSInL0() && getLevel(0).size() > MAX_COMPACTING_L0)
+        {
+            int l0compactions = getLevel(0).size() / MAX_COMPACTING_L0;
+            tasks += l0compactions;
+            estimated[0] += l0compactions;
         }
 
         logger.trace("Estimating {} compactions to do for {}.{}",

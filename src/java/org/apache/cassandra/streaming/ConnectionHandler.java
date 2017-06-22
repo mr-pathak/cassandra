@@ -42,6 +42,7 @@ import io.netty.util.concurrent.FastThreadLocalThread;
 import org.apache.cassandra.io.util.DataOutputStreamPlus;
 import org.apache.cassandra.io.util.BufferedDataOutputStreamPlus;
 import org.apache.cassandra.io.util.WrappedDataOutputStreamPlus;
+import org.apache.cassandra.net.IncomingStreamingConnection;
 import org.apache.cassandra.streaming.messages.StreamInitMessage;
 import org.apache.cassandra.streaming.messages.StreamMessage;
 import org.apache.cassandra.utils.FBUtilities;
@@ -63,11 +64,13 @@ public class ConnectionHandler
 
     private IncomingMessageHandler incoming;
     private OutgoingMessageHandler outgoing;
+    private final boolean isPreview;
 
-    ConnectionHandler(StreamSession session)
+    ConnectionHandler(StreamSession session, int incomingSocketTimeout, boolean isPreview)
     {
         this.session = session;
-        this.incoming = new IncomingMessageHandler(session);
+        this.isPreview = isPreview;
+        this.incoming = new IncomingMessageHandler(session, incomingSocketTimeout);
         this.outgoing = new OutgoingMessageHandler(session);
     }
 
@@ -83,28 +86,26 @@ public class ConnectionHandler
     {
         logger.debug("[Stream #{}] Sending stream init for incoming stream", session.planId());
         Socket incomingSocket = session.createConnection();
-        incoming.start(incomingSocket, StreamMessage.CURRENT_VERSION);
-        incoming.sendInitMessage(incomingSocket, true);
+        incoming.start(incomingSocket, StreamMessage.CURRENT_VERSION, true);
 
         logger.debug("[Stream #{}] Sending stream init for outgoing stream", session.planId());
         Socket outgoingSocket = session.createConnection();
-        outgoing.start(outgoingSocket, StreamMessage.CURRENT_VERSION);
-        outgoing.sendInitMessage(outgoingSocket, false);
+        outgoing.start(outgoingSocket, StreamMessage.CURRENT_VERSION, true);
     }
 
     /**
      * Set up outgoing message handler on receiving side.
      *
-     * @param socket socket to use for {@link org.apache.cassandra.streaming.ConnectionHandler.OutgoingMessageHandler}.
+     * @param connection Incoming connection to use for {@link OutgoingMessageHandler}.
      * @param version Streaming message version
      * @throws IOException
      */
-    public void initiateOnReceivingSide(Socket socket, boolean isForOutgoing, int version) throws IOException
+    public void initiateOnReceivingSide(IncomingStreamingConnection connection, boolean isForOutgoing, int version) throws IOException
     {
         if (isForOutgoing)
-            outgoing.start(socket, version);
+            outgoing.start(connection, version);
         else
-            incoming.start(socket, version);
+            incoming.start(connection, version);
     }
 
     public ListenableFuture<?> close()
@@ -143,6 +144,9 @@ public class ConnectionHandler
         if (outgoing.isClosed())
             throw new RuntimeException("Outgoing stream handler has been closed");
 
+        if (message.type == StreamMessage.Type.FILE && isPreview)
+            throw new RuntimeException("Cannot send file messages for preview streaming sessions");
+
         outgoing.enqueue(message);
     }
 
@@ -159,13 +163,16 @@ public class ConnectionHandler
         protected final StreamSession session;
 
         protected int protocolVersion;
+        private final boolean isOutgoingHandler;
         protected Socket socket;
 
         private final AtomicReference<SettableFuture<?>> closeFuture = new AtomicReference<>();
+        private IncomingStreamingConnection incomingConnection;
 
-        protected MessageHandler(StreamSession session)
+        protected MessageHandler(StreamSession session, boolean isOutgoingHandler)
         {
             this.session = session;
+            this.isOutgoingHandler = isOutgoingHandler;
         }
 
         protected abstract String name();
@@ -187,26 +194,34 @@ public class ConnectionHandler
         }
 
         @SuppressWarnings("resource")
-        public void sendInitMessage(Socket socket, boolean isForOutgoing) throws IOException
+        private void sendInitMessage() throws IOException
         {
-            StreamInitMessage message = new StreamInitMessage(
-                    FBUtilities.getBroadcastAddress(),
-                    session.sessionIndex(),
-                    session.planId(),
-                    session.description(),
-                    isForOutgoing,
-                    session.keepSSTableLevel(),
-                    session.isIncremental());
+            StreamInitMessage message = new StreamInitMessage(FBUtilities.getBroadcastAddress(),
+                                                              session.sessionIndex(),
+                                                              session.planId(),
+                                                              session.streamOperation(),
+                                                              !isOutgoingHandler,
+                                                              session.keepSSTableLevel(),
+                                                              session.getPendingRepair(),
+                                                              session.getPreviewKind());
             ByteBuffer messageBuf = message.createMessage(false, protocolVersion);
             DataOutputStreamPlus out = getWriteChannel(socket);
             out.write(messageBuf);
             out.flush();
         }
 
-        public void start(Socket socket, int protocolVersion)
+        public void start(IncomingStreamingConnection connection, int protocolVersion) throws IOException
+        {
+            this.incomingConnection = connection;
+            start(connection.socket, protocolVersion, false);
+        }
+
+        public void start(Socket socket, int protocolVersion, boolean initiator) throws IOException
         {
             this.socket = socket;
             this.protocolVersion = protocolVersion;
+            if (initiator)
+                sendInitMessage();
 
             new FastThreadLocalThread(this, name() + "-" + socket.getRemoteSocketAddress()).start();
         }
@@ -227,18 +242,32 @@ public class ConnectionHandler
 
         protected void signalCloseDone()
         {
+            if (!isClosed())
+                close();
+
             closeFuture.get().set(null);
 
             // We can now close the socket
-            try
+            if (incomingConnection != null)
             {
-                socket.close();
+                //this will close the underlying socket and remove it
+                //from active MessagingService connections (CASSANDRA-11854)
+                incomingConnection.close();
             }
-            catch (IOException e)
+            else
             {
-                // Erroring out while closing shouldn't happen but is not really a big deal, so just log
-                // it at DEBUG and ignore otherwise.
-                logger.debug("Unexpected error while closing streaming connection", e);
+                //this is an outgoing connection not registered in the MessagingService
+                //so we can close the socket directly
+                try
+                {
+                    socket.close();
+                }
+                catch (IOException e)
+                {
+                    // Erroring out while closing shouldn't happen but is not really a big deal, so just log
+                    // it at DEBUG and ignore otherwise.
+                    logger.debug("Unexpected error while closing streaming connection", e);
+                }
             }
         }
     }
@@ -248,9 +277,26 @@ public class ConnectionHandler
      */
     static class IncomingMessageHandler extends MessageHandler
     {
-        IncomingMessageHandler(StreamSession session)
+        private final int socketTimeout;
+
+        IncomingMessageHandler(StreamSession session, int socketTimeout)
         {
-            super(session);
+            super(session, false);
+            this.socketTimeout = socketTimeout;
+        }
+
+        @Override
+        public void start(Socket socket, int version, boolean initiator) throws IOException
+        {
+            try
+            {
+                socket.setSoTimeout(socketTimeout);
+            }
+            catch (SocketException e)
+            {
+                logger.warn("Could not set incoming socket timeout to {}", socketTimeout, e);
+            }
+            super.start(socket, version, initiator);
         }
 
         protected String name()
@@ -276,11 +322,6 @@ public class ConnectionHandler
                         session.messageReceived(message);
                     }
                 }
-            }
-            catch (SocketException e)
-            {
-                // socket is closed
-                close();
             }
             catch (Throwable t)
             {
@@ -315,7 +356,7 @@ public class ConnectionHandler
 
         OutgoingMessageHandler(StreamSession session)
         {
-            super(session);
+            super(session, true);
         }
 
         protected String name()
@@ -371,6 +412,7 @@ public class ConnectionHandler
             {
                 StreamMessage.serialize(message, out, protocolVersion, session);
                 out.flush();
+                message.sent();
             }
             catch (SocketException e)
             {

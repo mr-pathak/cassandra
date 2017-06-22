@@ -29,7 +29,8 @@ import com.google.common.collect.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.io.sstable.SSTable;
@@ -93,6 +94,12 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional
         {
             update.clear();
             obsolete.clear();
+        }
+
+        @Override
+        public String toString()
+        {
+            return String.format("[obsolete: %s, update: %s]", obsolete, update);
         }
     }
 
@@ -200,7 +207,9 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional
     public Throwable doCommit(Throwable accumulate)
     {
         assert staged.isEmpty() : "must be no actions introduced between prepareToCommit and a commit";
-        logger.trace("Committing update:{}, obsolete:{}", staged.update, staged.obsolete);
+
+        if (logger.isTraceEnabled())
+            logger.trace("Committing transaction over {} staged: {}, logged: {}", originals, staged, logged);
 
         // accumulate must be null if we have been used correctly, so fail immediately if it is not
         maybeFail(accumulate);
@@ -226,7 +235,7 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional
     public Throwable doAbort(Throwable accumulate)
     {
         if (logger.isTraceEnabled())
-            logger.trace("Aborting transaction over {}, with ({},{}) logged and ({},{}) staged", originals, logged.update, logged.obsolete, staged.update, staged.obsolete);
+            logger.trace("Aborting transaction over {} staged: {}, logged: {}", originals, staged, logged);
 
         accumulate = abortObsoletion(obsoletions, accumulate);
 
@@ -290,7 +299,7 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional
     private Throwable checkpoint(Throwable accumulate)
     {
         if (logger.isTraceEnabled())
-            logger.trace("Checkpointing update:{}, obsolete:{}", staged.update, staged.obsolete);
+            logger.trace("Checkpointing staged {}", staged);
 
         if (staged.isEmpty())
             return accumulate;
@@ -525,7 +534,12 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional
         log.untrackNew(table);
     }
 
-    public static boolean removeUnfinishedLeftovers(CFMetaData metadata)
+    public static boolean removeUnfinishedLeftovers(ColumnFamilyStore cfs)
+    {
+        return LogTransaction.removeUnfinishedLeftovers(cfs.getDirectories().getCFDirectories());
+    }
+
+    public static boolean removeUnfinishedLeftovers(TableMetadata metadata)
     {
         return LogTransaction.removeUnfinishedLeftovers(metadata);
     }

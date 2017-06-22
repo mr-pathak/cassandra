@@ -30,8 +30,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.junit.*;
 
-import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
+import org.apache.cassandra.concurrent.NamedThreadFactory;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.RandomPartitioner;
@@ -50,6 +50,11 @@ import static org.junit.Assert.assertTrue;
 
 public class RemoveTest
 {
+    static
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
+
     static final IPartitioner partitioner = RandomPartitioner.instance;
     StorageService ss = StorageService.instance;
     TokenMetadata tmd = ss.getTokenMetadata();
@@ -65,7 +70,6 @@ public class RemoveTest
     public static void setupClass() throws ConfigurationException
     {
         oldPartitioner = StorageService.instance.setPartitionerUnsafe(partitioner);
-        SchemaLoader.loadSchema();
     }
 
     @AfterClass
@@ -83,7 +87,6 @@ public class RemoveTest
         Util.createInitialRing(ss, partitioner, endpointTokens, keyTokens, hosts, hostIds, 6);
 
         MessagingService.instance().listen();
-        Gossiper.instance.start(1);
         removalhost = hosts.get(5);
         hosts.remove(removalhost);
         removalId = hostIds.get(5);
@@ -136,29 +139,26 @@ public class RemoveTest
     {
         // start removal in background and send replication confirmations
         final AtomicBoolean success = new AtomicBoolean(false);
-        Thread remover = new Thread()
+        Thread remover = NamedThreadFactory.createThread(() ->
         {
-            public void run()
+            try
             {
-                try
-                {
-                    ss.removeNode(removalId.toString());
-                }
-                catch (Exception e)
-                {
-                    System.err.println(e);
-                    e.printStackTrace();
-                    return;
-                }
-                success.set(true);
+                ss.removeNode(removalId.toString());
             }
-        };
+            catch (Exception e)
+            {
+                System.err.println(e);
+                e.printStackTrace();
+                return;
+            }
+            success.set(true);
+        });
         remover.start();
 
         Thread.sleep(1000); // make sure removal is waiting for confirmation
 
         assertTrue(tmd.isLeaving(removalhost));
-        assertEquals(1, tmd.getLeavingEndpoints().size());
+        assertEquals(1, tmd.getSizeOfLeavingEndpoints());
 
         for (InetAddress host : hosts)
         {
@@ -169,6 +169,6 @@ public class RemoveTest
         remover.join();
 
         assertTrue(success.get());
-        assertTrue(tmd.getLeavingEndpoints().isEmpty());
+        assertTrue(tmd.getSizeOfLeavingEndpoints() == 0);
     }
 }

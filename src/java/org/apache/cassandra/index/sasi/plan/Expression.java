@@ -22,7 +22,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.index.sasi.analyzer.AbstractAnalyzer;
 import org.apache.cassandra.index.sasi.conf.ColumnIndex;
@@ -115,7 +115,7 @@ public class Expression
     @VisibleForTesting
     public Expression(String name, AbstractType<?> validator)
     {
-        this(null, new ColumnIndex(UTF8Type.instance, ColumnDefinition.regularDef("sasi", "internal", name, validator), null));
+        this(null, new ColumnIndex(UTF8Type.instance, ColumnMetadata.regularColumn("sasi", "internal", name, validator), null));
     }
 
     public Expression setLower(Bound newLower)
@@ -166,17 +166,30 @@ public class Expression
                 break;
 
             case LTE:
-                upperInclusive = true;
+                if (index.getDefinition().isReversedType())
+                    lowerInclusive = true;
+                else
+                    upperInclusive = true;
             case LT:
                 operation = Op.RANGE;
-                upper = new Bound(value, upperInclusive);
+                if (index.getDefinition().isReversedType())
+                    lower = new Bound(value, lowerInclusive);
+                else
+                    upper = new Bound(value, upperInclusive);
                 break;
 
             case GTE:
-                lowerInclusive = true;
+                if (index.getDefinition().isReversedType())
+                    upperInclusive = true;
+                else
+                    lowerInclusive = true;
             case GT:
                 operation = Op.RANGE;
-                lower = new Bound(value, lowerInclusive);
+                if (index.getDefinition().isReversedType())
+                    upper = new Bound(value, upperInclusive);
+                else
+                    lower = new Bound(value, lowerInclusive);
+
                 break;
         }
 
@@ -322,9 +335,6 @@ public class Expression
         if (!hasLower())
             return true;
 
-        if (nonMatchingPartial(term))
-            return false;
-
         int cmp = term.compareTo(validator, lower.value, false);
         return cmp > 0 || cmp == 0 && lower.inclusive;
     }
@@ -333,9 +343,6 @@ public class Expression
     {
         if (!hasUpper())
             return true;
-
-        if (nonMatchingPartial(term))
-            return false;
 
         int cmp = term.compareTo(validator, upper.value, false);
         return cmp < 0 || cmp == 0 && upper.inclusive;
@@ -383,11 +390,6 @@ public class Expression
                 && Objects.equals(lower, o.lower)
                 && Objects.equals(upper, o.upper)
                 && exclusions.equals(o.exclusions);
-    }
-
-    private boolean nonMatchingPartial(OnDiskIndex.DataTerm term)
-    {
-        return term.isPartial() && operation == Op.PREFIX;
     }
 
     public static class Bound

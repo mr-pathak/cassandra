@@ -19,15 +19,15 @@ package org.apache.cassandra.cql3;
 
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.stream.Collectors;
 
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.marshal.TupleType;
-import org.apache.cassandra.db.marshal.UTF8Type;
-import org.apache.cassandra.db.marshal.UserType;
+import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.db.rows.CellPath;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.apache.cassandra.cql3.Constants.UNSET_VALUE;
@@ -44,15 +44,86 @@ public abstract class UserTypes
         UserType ut = (UserType)column.type;
         return new ColumnSpecification(column.ksName,
                                        column.cfName,
-                                       new ColumnIdentifier(column.name + "." + UTF8Type.instance.compose(ut.fieldName(field)), true),
+                                       new ColumnIdentifier(column.name + "." + ut.fieldName(field), true),
                                        ut.fieldType(field));
+    }
+
+    public static <T extends AssignmentTestable> void validateUserTypeAssignableTo(ColumnSpecification receiver,
+                                                                                   Map<FieldIdentifier, T> entries)
+    {
+        if (!receiver.type.isUDT())
+            throw new InvalidRequestException(String.format("Invalid user type literal for %s of type %s", receiver, receiver.type.asCQL3Type()));
+
+        UserType ut = (UserType) receiver.type;
+        for (int i = 0; i < ut.size(); i++)
+        {
+            FieldIdentifier field = ut.fieldName(i);
+            T value = entries.get(field);
+            if (value == null)
+                continue;
+
+            ColumnSpecification fieldSpec = fieldSpecOf(receiver, i);
+            if (!value.testAssignment(receiver.ksName, fieldSpec).isAssignable())
+            {
+                throw new InvalidRequestException(String.format("Invalid user type literal for %s: field %s is not of type %s",
+                        receiver, field, fieldSpec.type.asCQL3Type()));
+            }
+        }
+    }
+
+    /**
+     * Tests that the map with the specified entries can be assigned to the specified column.
+     *
+     * @param receiver the receiving column
+     * @param entries the map entries
+     */
+    public static <T extends AssignmentTestable> AssignmentTestable.TestResult testUserTypeAssignment(ColumnSpecification receiver,
+                                                                                                      Map<FieldIdentifier, T> entries)
+    {
+        try
+        {
+            validateUserTypeAssignableTo(receiver, entries);
+            return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
+        }
+        catch (InvalidRequestException e)
+        {
+            return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
+        }
+    }
+
+    /**
+     * Create a {@code String} representation of the user type from the specified items associated to
+     * the user type entries.
+     *
+     * @param items items associated to the user type entries
+     * @return a {@code String} representation of the user type
+     */
+    public static <T> String userTypeToString(Map<FieldIdentifier, T> items)
+    {
+        return userTypeToString(items, Object::toString);
+    }
+
+    /**
+     * Create a {@code String} representation of the user type from the specified items associated to
+     * the user type entries.
+     *
+     * @param items items associated to the user type entries
+     * @return a {@code String} representation of the user type
+     */
+    public static <T> String userTypeToString(Map<FieldIdentifier, T> items,
+                                              java.util.function.Function<T, String> mapper)
+    {
+        return items.entrySet()
+                    .stream()
+                    .map(p -> String.format("%s: %s", p.getKey(), mapper.apply(p.getValue())))
+                    .collect(Collectors.joining(", ", "{", "}"));
     }
 
     public static class Literal extends Term.Raw
     {
-        public final Map<ColumnIdentifier, Term.Raw> entries;
+        public final Map<FieldIdentifier, Term.Raw> entries;
 
-        public Literal(Map<ColumnIdentifier, Term.Raw> entries)
+        public Literal(Map<FieldIdentifier, Term.Raw> entries)
         {
             this.entries = entries;
         }
@@ -67,7 +138,7 @@ public abstract class UserTypes
             int foundValues = 0;
             for (int i = 0; i < ut.size(); i++)
             {
-                ColumnIdentifier field = new ColumnIdentifier(ut.fieldName(i), UTF8Type.instance);
+                FieldIdentifier field = ut.fieldName(i);
                 Term.Raw raw = entries.get(field);
                 if (raw == null)
                     raw = Constants.NULL_LITERAL;
@@ -83,9 +154,9 @@ public abstract class UserTypes
             if (foundValues != entries.size())
             {
                 // We had some field that are not part of the type
-                for (ColumnIdentifier id : entries.keySet())
+                for (FieldIdentifier id : entries.keySet())
                 {
-                    if (!ut.fieldNames().contains(id.bytes))
+                    if (!ut.fieldNames().contains(id))
                         throw new InvalidRequestException(String.format("Unknown field '%s' in value of user defined type %s", id, ut.getNameAsString()));
                 }
             }
@@ -96,53 +167,22 @@ public abstract class UserTypes
 
         private void validateAssignableTo(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
         {
-            if (!receiver.type.isUDT())
-                throw new InvalidRequestException(String.format("Invalid user type literal for %s of type %s", receiver, receiver.type.asCQL3Type()));
-
-            UserType ut = (UserType)receiver.type;
-            for (int i = 0; i < ut.size(); i++)
-            {
-                ColumnIdentifier field = new ColumnIdentifier(ut.fieldName(i), UTF8Type.instance);
-                Term.Raw value = entries.get(field);
-                if (value == null)
-                    continue;
-
-                ColumnSpecification fieldSpec = fieldSpecOf(receiver, i);
-                if (!value.testAssignment(keyspace, fieldSpec).isAssignable())
-                {
-                    throw new InvalidRequestException(String.format("Invalid user type literal for %s: field %s is not of type %s",
-                            receiver, field, fieldSpec.type.asCQL3Type()));
-                }
-            }
+            validateUserTypeAssignableTo(receiver, entries);
         }
 
         public AssignmentTestable.TestResult testAssignment(String keyspace, ColumnSpecification receiver)
         {
-            try
-            {
-                validateAssignableTo(keyspace, receiver);
-                return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
-            }
-            catch (InvalidRequestException e)
-            {
-                return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
-            }
+            return testUserTypeAssignment(receiver, entries);
+        }
+
+        public AbstractType<?> getExactTypeIfKnown(String keyspace)
+        {
+            return null;
         }
 
         public String getText()
         {
-            StringBuilder sb = new StringBuilder();
-            sb.append("{");
-            Iterator<Map.Entry<ColumnIdentifier, Term.Raw>> iter = entries.entrySet().iterator();
-            while (iter.hasNext())
-            {
-                Map.Entry<ColumnIdentifier, Term.Raw> entry = iter.next();
-                sb.append(entry.getKey()).append(": ").append(entry.getValue().getText());
-                if (iter.hasNext())
-                    sb.append(", ");
-            }
-            sb.append("}");
-            return sb.toString();
+            return userTypeToString(entries, Term.Raw::getText);
         }
     }
 
@@ -169,7 +209,7 @@ public abstract class UserTypes
             return new Value(type, type.split(bytes));
         }
 
-        public ByteBuffer get(int protocolVersion)
+        public ByteBuffer get(ProtocolVersion protocolVersion)
         {
             return TupleType.buildValue(elements);
         }
@@ -275,7 +315,7 @@ public abstract class UserTypes
 
     public static class Setter extends Operation
     {
-        public Setter(ColumnDefinition column, Term t)
+        public Setter(ColumnMetadata column, Term t)
         {
             super(column, t);
         }
@@ -294,10 +334,11 @@ public abstract class UserTypes
                 if (value == null)
                     return;
 
-                Iterator<ByteBuffer> fieldNameIter = userTypeValue.type.fieldNames().iterator();
+                Iterator<FieldIdentifier> fieldNameIter = userTypeValue.type.fieldNames().iterator();
                 for (ByteBuffer buffer : userTypeValue.elements)
                 {
-                    ByteBuffer fieldName = fieldNameIter.next();
+                    assert fieldNameIter.hasNext();
+                    FieldIdentifier fieldName = fieldNameIter.next();
                     if (buffer == null)
                         continue;
 
@@ -318,9 +359,9 @@ public abstract class UserTypes
 
     public static class SetterByField extends Operation
     {
-        private final ColumnIdentifier field;
+        private final FieldIdentifier field;
 
-        public SetterByField(ColumnDefinition column, ColumnIdentifier field, Term t)
+        public SetterByField(ColumnMetadata column, FieldIdentifier field, Term t)
         {
             super(column, t);
             this.field = field;
@@ -335,7 +376,7 @@ public abstract class UserTypes
             if (value == UNSET_VALUE)
                 return;
 
-            CellPath fieldPath = ((UserType) column.type).cellPathForField(field.bytes);
+            CellPath fieldPath = ((UserType) column.type).cellPathForField(field);
             if (value == null)
                 params.addTombstone(column, fieldPath);
             else
@@ -345,9 +386,9 @@ public abstract class UserTypes
 
     public static class DeleterByField extends Operation
     {
-        private final ColumnIdentifier field;
+        private final FieldIdentifier field;
 
-        public DeleterByField(ColumnDefinition column, ColumnIdentifier field)
+        public DeleterByField(ColumnMetadata column, FieldIdentifier field)
         {
             super(column, null);
             this.field = field;
@@ -358,7 +399,7 @@ public abstract class UserTypes
             // we should not get here for frozen UDTs
             assert column.type.isMultiCell() : "Attempted to delete a single field from a frozen UDT";
 
-            CellPath fieldPath = ((UserType) column.type).cellPathForField(field.bytes);
+            CellPath fieldPath = ((UserType) column.type).cellPathForField(field);
             params.addTombstone(column, fieldPath);
         }
     }

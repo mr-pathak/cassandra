@@ -15,6 +15,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.cassandra.db.commitlog;
 
 import java.io.IOException;
@@ -105,10 +106,10 @@ public class CommitLogDescriptorTest
     public void testDescriptorPersistence() throws IOException
     {
         testDescriptorPersistence(new CommitLogDescriptor(11, null, neverEnabledEncryption));
-        testDescriptorPersistence(new CommitLogDescriptor(CommitLogDescriptor.VERSION_21, 13, null, neverEnabledEncryption));
-        testDescriptorPersistence(new CommitLogDescriptor(CommitLogDescriptor.VERSION_22, 15, null, neverEnabledEncryption));
-        testDescriptorPersistence(new CommitLogDescriptor(CommitLogDescriptor.VERSION_22, 17, new ParameterizedClass("LZ4Compressor", null), neverEnabledEncryption));
-        testDescriptorPersistence(new CommitLogDescriptor(CommitLogDescriptor.VERSION_22, 19,
+        testDescriptorPersistence(new CommitLogDescriptor(CommitLogDescriptor.current_version, 13, null, neverEnabledEncryption));
+        testDescriptorPersistence(new CommitLogDescriptor(CommitLogDescriptor.current_version, 15, null, neverEnabledEncryption));
+        testDescriptorPersistence(new CommitLogDescriptor(CommitLogDescriptor.current_version, 17, new ParameterizedClass("LZ4Compressor", null), neverEnabledEncryption));
+        testDescriptorPersistence(new CommitLogDescriptor(CommitLogDescriptor.current_version, 19,
                                                           new ParameterizedClass("StubbyCompressor", ImmutableMap.of("parameter1", "value1", "flag2", "55", "argument3", "null")
                                                           ), neverEnabledEncryption));
     }
@@ -121,10 +122,11 @@ public class CommitLogDescriptorTest
         for (int i=0; i<65535; ++i)
             params.put("key"+i, Integer.toString(i, 16));
         try {
-            CommitLogDescriptor desc = new CommitLogDescriptor(CommitLogDescriptor.VERSION_22,
+            CommitLogDescriptor desc = new CommitLogDescriptor(CommitLogDescriptor.current_version,
                                                                21,
                                                                new ParameterizedClass("LZ4Compressor", params),
                                                                neverEnabledEncryption);
+
             ByteBuffer buf = ByteBuffer.allocate(1024000);
             CommitLogDescriptor.writeHeader(buf, desc);
             Assert.fail("Parameter object too long should fail on writing descriptor.");
@@ -307,5 +309,4 @@ public class CommitLogDescriptorTest
         CommitLogDescriptor desc2 = new CommitLogDescriptor(CommitLogDescriptor.current_version, 1, compression, enabledEncryption);
         Assert.assertEquals(desc1, desc2);
     }
-
 }

@@ -34,6 +34,7 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.concurrent.DebuggableScheduledThreadPoolExecutor;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.marshal.BytesType;
@@ -50,6 +51,7 @@ import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.net.MessageIn;
 import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.service.WriteResponseHandler;
 import org.apache.cassandra.utils.FBUtilities;
@@ -121,20 +123,15 @@ public class BatchlogManager implements BatchlogManagerMBean
 
     public static void store(Batch batch, boolean durableWrites)
     {
-        RowUpdateBuilder builder =
-            new RowUpdateBuilder(SystemKeyspace.Batches, batch.creationTime, batch.id)
-                .clustering()
-                .add("version", MessagingService.current_version);
-
-        for (ByteBuffer mutation : batch.encodedMutations)
-            builder.addListEntry("mutations", mutation);
+        List<ByteBuffer> mutations = new ArrayList<>(batch.encodedMutations.size() + batch.decodedMutations.size());
+        mutations.addAll(batch.encodedMutations);
 
         for (Mutation mutation : batch.decodedMutations)
         {
             try (DataOutputBuffer buffer = new DataOutputBuffer())
             {
                 Mutation.serializer.serialize(mutation, buffer, MessagingService.current_version);
-                builder.addListEntry("mutations", buffer.buffer());
+                mutations.add(buffer.buffer());
             }
             catch (IOException e)
             {
@@ -143,13 +140,19 @@ public class BatchlogManager implements BatchlogManagerMBean
             }
         }
 
-        builder.build().apply(durableWrites);
+        PartitionUpdate.SimpleBuilder builder = PartitionUpdate.simpleBuilder(SystemKeyspace.Batches, batch.id);
+        builder.row()
+               .timestamp(batch.creationTime)
+               .add("version", MessagingService.current_version)
+               .appendAll("mutations", mutations);
+
+        builder.buildAsMutation().apply(durableWrites);
     }
 
     @VisibleForTesting
     public int countAllBatches()
     {
-        String query = String.format("SELECT count(*) FROM %s.%s", SystemKeyspace.NAME, SystemKeyspace.BATCHES);
+        String query = String.format("SELECT count(*) FROM %s.%s", SchemaConstants.SYSTEM_KEYSPACE_NAME, SystemKeyspace.BATCHES);
         UntypedResultSet results = executeInternal(query);
         if (results == null || results.isEmpty())
             return 0;
@@ -185,7 +188,7 @@ public class BatchlogManager implements BatchlogManagerMBean
 
         // rate limit is in bytes per second. Uses Double.MAX_VALUE if disabled (set to 0 in cassandra.yaml).
         // max rate is scaled by the number of nodes in the cluster (same as for HHOM - see CASSANDRA-5272).
-        int endpointsCount = StorageService.instance.getTokenMetadata().getAllEndpoints().size();
+        int endpointsCount = StorageService.instance.getTokenMetadata().getSizeOfAllEndpoints();
         if (endpointsCount <= 0)
         {
             logger.trace("Replay cancelled as there are no peers in the ring.");
@@ -195,13 +198,13 @@ public class BatchlogManager implements BatchlogManagerMBean
         RateLimiter rateLimiter = RateLimiter.create(throttleInKB == 0 ? Double.MAX_VALUE : throttleInKB * 1024);
 
         UUID limitUuid = UUIDGen.maxTimeUUID(System.currentTimeMillis() - getBatchlogTimeout());
-        ColumnFamilyStore store = Keyspace.open(SystemKeyspace.NAME).getColumnFamilyStore(SystemKeyspace.BATCHES);
+        ColumnFamilyStore store = Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME).getColumnFamilyStore(SystemKeyspace.BATCHES);
         int pageSize = calculatePageSize(store);
         // There cannot be any live content where token(id) <= token(lastReplayedUuid) as every processed batch is
         // deleted, but the tombstoned content may still be present in the tables. To avoid walking over it we specify
         // token(id) > token(lastReplayedUuid) as part of the query.
         String query = String.format("SELECT id, mutations, version FROM %s.%s WHERE token(id) > token(?) AND token(id) <= token(?)",
-                                     SystemKeyspace.NAME,
+                                     SchemaConstants.SYSTEM_KEYSPACE_NAME,
                                      SystemKeyspace.BATCHES);
         UntypedResultSet batches = executeInternalWithPaging(query, pageSize, lastReplayedUuid, limitUuid);
         processBatchlogEntries(batches, pageSize, rateLimiter);
@@ -362,9 +365,9 @@ public class BatchlogManager implements BatchlogManagerMBean
         // truncated.
         private void addMutation(Mutation mutation)
         {
-            for (UUID cfId : mutation.getColumnFamilyIds())
-                if (writtenAt <= SystemKeyspace.getTruncatedAt(cfId))
-                    mutation = mutation.without(cfId);
+            for (TableId tableId : mutation.getTableIds())
+                if (writtenAt <= SystemKeyspace.getTruncatedAt(tableId))
+                    mutation = mutation.without(tableId);
 
             if (!mutation.isEmpty())
                 mutations.add(mutation);
@@ -441,7 +444,7 @@ public class BatchlogManager implements BatchlogManagerMBean
             if (liveEndpoints.isEmpty())
                 return null;
 
-            ReplayWriteResponseHandler<Mutation> handler = new ReplayWriteResponseHandler<>(liveEndpoints);
+            ReplayWriteResponseHandler<Mutation> handler = new ReplayWriteResponseHandler<>(liveEndpoints, System.nanoTime());
             MessageOut<Mutation> message = mutation.createMessage();
             for (InetAddress endpoint : liveEndpoints)
                 MessagingService.instance().sendRR(message, endpoint, handler, false);
@@ -464,9 +467,9 @@ public class BatchlogManager implements BatchlogManagerMBean
         {
             private final Set<InetAddress> undelivered = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
-            ReplayWriteResponseHandler(Collection<InetAddress> writeEndpoints)
+            ReplayWriteResponseHandler(Collection<InetAddress> writeEndpoints, long queryStartNanoTime)
             {
-                super(writeEndpoints, Collections.<InetAddress>emptySet(), null, null, null, WriteType.UNLOGGED_BATCH);
+                super(writeEndpoints, Collections.<InetAddress>emptySet(), null, null, null, WriteType.UNLOGGED_BATCH, queryStartNanoTime);
                 undelivered.addAll(writeEndpoints);
             }
 

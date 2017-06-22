@@ -1,3 +1,23 @@
+/*
+ *
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ *
+ */
 package org.apache.cassandra.index;
 
 import java.util.Collection;
@@ -6,7 +26,7 @@ import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.function.BiFunction;
 
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.compaction.OperationType;
@@ -50,12 +70,12 @@ import org.apache.cassandra.utils.concurrent.OpOrder;
  * SecondaryIndexManager. It includes methods for registering and un-registering an index, performing maintenance
  * tasks such as (re)building an index from SSTable data, flushing, invalidating and so forth, as well as some to
  * retrieve general metadata about the index (index name, any internal tables used for persistence etc).
- * Several of these maintenance functions have a return type of Callable<?>; the expectation for these methods is
+ * Several of these maintenance functions have a return type of {@code Callable<?>}; the expectation for these methods is
  * that any work required to be performed by the method be done inside the Callable so that the responsibility for
  * scheduling its execution can rest with SecondaryIndexManager. For instance, a task like reloading index metadata
  * following potential updates caused by modifications to the base table may be performed in a blocking way. In
  * contrast, adding a new index may require it to be built from existing SSTable data, a potentially expensive task
- * which should be performed asyncronously.
+ * which should be performed asynchronously.
  *
  * Index Selection:
  * There are two facets to index selection, write time and read time selection. The former is concerned with
@@ -88,10 +108,10 @@ import org.apache.cassandra.utils.concurrent.OpOrder;
  * whether any of them are supported by a registered Index. supportsExpression is used to filter out Indexes which
  * cannot support a given Expression. After filtering, the set of candidate indexes are ranked according to the result
  * of getEstimatedResultRows and the most selective (i.e. the one expected to return the smallest number of results) is
- * chosen. A Searcher instance is then obtained from the searcherFor method & used to perform the actual Index lookup.
+ * chosen. A Searcher instance is then obtained from the searcherFor method and used to perform the actual Index lookup.
  * Finally, Indexes can define a post processing step to be performed on the coordinator, after results (partitions from
  * the primary table) have been received from replicas and reconciled. This post processing is defined as a
- * java.util.functions.BiFunction<PartitionIterator, RowFilter, PartitionIterator>, that is a function which takes as
+ * {@code java.util.functions.BiFunction<PartitionIterator, RowFilter, PartitionIterator>}, that is a function which takes as
  * arguments a PartitionIterator (containing the reconciled result rows) and a RowFilter (from the ReadCommand being
  * executed) and returns another iterator of partitions, possibly having transformed the initial results in some way.
  * The post processing function is obtained from the Index's postProcessorFor method; the built-in indexes which ship
@@ -99,11 +119,11 @@ import org.apache.cassandra.utils.concurrent.OpOrder;
  *
  * An optional static method may be provided to validate custom index options (two variants are supported):
  *
- * <pre>{@code public static Map<String, String> validateOptions(Map<String, String> options);</pre>
+ * <pre>{@code public static Map<String, String> validateOptions(Map<String, String> options);}</pre>
  *
  * The input is the map of index options supplied in the WITH clause of a CREATE INDEX statement.
  *
- * <pre>{@code public static Map<String, String> validateOptions(Map<String, String> options, CFMetaData cfm);}</pre>
+ * <pre>{@code public static Map<String, String> validateOptions(Map<String, String> options, TableMetadata metadata);}</pre>
  *
  * In this version, the base table's metadata is also supplied as an argument.
  * If both overloaded methods are provided, only the one including the base table's metadata will be invoked.
@@ -233,6 +253,17 @@ public interface Index
     public Callable<?> getTruncateTask(long truncatedAt);
 
     /**
+     * Return a task to be executed before the node enters NORMAL state and finally joins the ring.
+     *
+     * @param hadBootstrap If the node had bootstrap before joining.
+     * @return task to be executed by the index manager before joining the ring.
+     */
+    default public Callable<?> getPreJoinTask(boolean hadBootstrap)
+    {
+        return null;
+    }
+
+    /**
      * Return true if this index can be built or rebuilt when the index manager determines it is necessary. Returning
      * false enables the index implementation (or some other component) to control if and when SSTable data is
      * incorporated into the index.
@@ -272,7 +303,7 @@ public interface Index
      * @return true if the index depends on the supplied column being present; false if the column may be
      *              safely dropped or modified without adversely affecting the index
      */
-    public boolean dependsOn(ColumnDefinition column);
+    public boolean dependsOn(ColumnMetadata column);
 
     /**
      * Called to determine whether this index can provide a searcher to execute a query on the
@@ -282,7 +313,7 @@ public interface Index
      * @param operator the operator of a search query predicate
      * @return true if this index is capable of supporting such expressions, false otherwise
      */
-    public boolean supportsExpression(ColumnDefinition column, Operator operator);
+    public boolean supportsExpression(ColumnMetadata column, Operator operator);
 
     /**
      * If the index supports custom search expressions using the
@@ -354,7 +385,7 @@ public interface Index
      * that type of transaction, ...).
      */
     public Indexer indexerFor(DecoratedKey key,
-                              PartitionColumns columns,
+                              RegularAndStaticColumns columns,
                               int nowInSec,
                               OpOrder.Group opGroup,
                               IndexTransaction.Type transactionType);
@@ -414,7 +445,7 @@ public interface Index
          * Notification of a modification to a row in the base table's Memtable.
          * This is allow an Index implementation to clean up entries for base data which is
          * never flushed to disk (and so will not be purged during compaction).
-         * It's important to note that the old & new rows supplied here may not represent
+         * It's important to note that the old and new rows supplied here may not represent
          * the totality of the data for the Row with this particular Clustering. There may be
          * additional column data in SSTables which is not present in either the old or new row,
          * so implementations should be aware of that.

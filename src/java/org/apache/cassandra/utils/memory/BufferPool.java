@@ -68,7 +68,8 @@ public class BufferPool
     private static final GlobalPool globalPool = new GlobalPool();
 
     /** A thread local pool of chunks, where chunks come from the global pool */
-    private static final FastThreadLocal<LocalPool> localPool = new FastThreadLocal<LocalPool>() {
+    private static final FastThreadLocal<LocalPool> localPool = new FastThreadLocal<LocalPool>()
+    {
         @Override
         protected LocalPool initialValue()
         {
@@ -226,7 +227,7 @@ public class BufferPool
             if (DISABLED)
                 logger.info("Global buffer pool is disabled, allocating {}", ALLOCATE_ON_HEAP_WHEN_EXAHUSTED ? "on heap" : "off heap");
             else
-                logger.info("Global buffer pool is enabled, when pool is exahusted (max is {}) it will allocate {}",
+                logger.info("Global buffer pool is enabled, when pool is exhausted (max is {}) it will allocate {}",
                             FBUtilities.prettyPrintMemory(MEMORY_USAGE_THRESHOLD),
                             ALLOCATE_ON_HEAP_WHEN_EXAHUSTED ? "on heap" : "off heap");
         }

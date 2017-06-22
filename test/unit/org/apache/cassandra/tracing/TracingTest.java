@@ -22,17 +22,25 @@ import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
+import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.utils.progress.ProgressEvent;
-import org.apache.cassandra.utils.progress.ProgressListener;
+import org.apache.commons.lang3.StringUtils;
 
 public final class TracingTest
 {
+    @BeforeClass
+    public static void setupDD()
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
 
     @Test
     public void test()
@@ -95,6 +103,32 @@ public final class TracingTest
     }
 
     @Test
+    public void test_customPayload()
+    {
+        List<String> traces = new ArrayList<>();
+        ByteBuffer customPayloadValue = ByteBuffer.wrap("test-value".getBytes());
+
+        Map<String,ByteBuffer> customPayload = Collections.singletonMap("test-key", customPayloadValue);
+
+        TracingImpl tracing = new TracingImpl(traces);
+        tracing.newSession(customPayload);
+        TraceState state = tracing.begin("test-custom_payload", Collections.<String,String>emptyMap());
+        state.trace("test-1");
+        state.trace("test-2");
+        state.trace("test-3");
+        tracing.stopSession();
+
+        assert null == tracing.get();
+        assert 4 == traces.size();
+        assert "test-custom_payload".equals(traces.get(0));
+        assert "test-1".equals(traces.get(1));
+        assert "test-2".equals(traces.get(2));
+        assert "test-3".equals(traces.get(3));
+        assert tracing.payloads.containsKey("test-key");
+        assert customPayloadValue.equals(tracing.payloads.get("test-key"));
+    }
+
+    @Test
     public void test_states()
     {
         List<String> traces = new ArrayList<>();
@@ -120,24 +154,25 @@ public final class TracingTest
         tracing.begin("test-request", Collections.<String,String>emptyMap());
         tracing.get().enableActivityNotification("test-tag");
 
-        tracing.get().addProgressListener(
-                new ProgressListener()
-                {
-                    public void progress(String tag, ProgressEvent pe)
-                    {
-                        assert "test-tag".equals(tag);
-                        assert "test-trace".equals(pe.getMessage());
-                    }
-                });
+        tracing.get().addProgressListener((String tag, ProgressEvent pe) -> {
+            assert "test-tag".equals(tag);
+            assert "test-trace".equals(pe.getMessage());
+        });
 
         tracing.get().trace("test-trace");
         tracing.stopSession();
         assert null == tracing.get();
     }
 
-    private class TracingImpl extends Tracing
+    private static final class TracingImpl extends Tracing
     {
         private final List<String> traces;
+        private final Map<String,ByteBuffer> payloads = new HashMap<>();
+
+        public TracingImpl()
+        {
+            this(new ArrayList<>());
+        }
 
         public TracingImpl(List<String> traces)
         {
@@ -153,6 +188,15 @@ public final class TracingTest
             return get();
         }
 
+        protected UUID newSession(UUID sessionId, TraceType traceType, Map<String,ByteBuffer> customPayload)
+        {
+            if (!customPayload.isEmpty())
+                logger.info("adding custom payload items {}", StringUtils.join(customPayload.keySet(), ','));
+
+            payloads.putAll(customPayload);
+            return super.newSession(sessionId, traceType, customPayload);
+        }
+
         protected TraceState newTraceState(InetAddress ia, UUID uuid, Tracing.TraceType tt)
         {
             return new TraceState(ia, uuid, tt)
@@ -162,6 +206,9 @@ public final class TracingTest
                     traces.add(string);
                 }
 
+                protected void waitForPendingEvents()
+                {
+                }
             };
         }
 

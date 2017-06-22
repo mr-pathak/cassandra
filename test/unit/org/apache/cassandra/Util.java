@@ -19,7 +19,9 @@ package org.apache.cassandra;
  *
  */
 
+import java.io.Closeable;
 import java.io.EOFException;
+import java.io.IOError;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
@@ -34,17 +36,26 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Iterators;
 import org.apache.commons.lang3.StringUtils;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.ColumnDefinition;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.ColumnIdentifier;
+
 import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.Directories.DataDirectory;
 import org.apache.cassandra.db.compaction.AbstractCompactionTask;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.AsciiType;
+import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.partitions.*;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.dht.IPartitioner;
+
 import org.apache.cassandra.dht.RandomPartitioner.BigIntegerToken;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
@@ -54,10 +65,11 @@ import org.apache.cassandra.gms.VersionedValue;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.service.pager.PagingState;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.CounterId;
 import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.concurrent.OpOrder;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
@@ -65,7 +77,9 @@ import static org.junit.Assert.assertTrue;
 
 public class Util
 {
-    private static List<UUID> hostIdPool = new ArrayList<UUID>();
+    private static final Logger logger = LoggerFactory.getLogger(Util.class);
+
+    private static List<UUID> hostIdPool = new ArrayList<>();
 
     public static IPartitioner testPartitioner()
     {
@@ -95,13 +109,6 @@ public class Util
     public static PartitionPosition rp(String key, IPartitioner partitioner)
     {
         return PartitionPosition.ForKey.get(ByteBufferUtil.bytes(key), partitioner);
-    }
-
-    public static Cell getRegularCell(CFMetaData metadata, Row row, String name)
-    {
-        ColumnDefinition column = metadata.getColumnDefinition(ByteBufferUtil.bytes(name));
-        assert column != null;
-        return row.getCell(column);
     }
 
     public static Clustering clustering(ClusteringComparator comparator, Object... o)
@@ -166,12 +173,12 @@ public class Util
     {
         IMutation first = mutations.get(0);
         String keyspaceName = first.getKeyspaceName();
-        UUID cfid = first.getColumnFamilyIds().iterator().next();
+        TableId tableId = first.getTableIds().iterator().next();
 
         for (Mutation rm : mutations)
             rm.applyUnsafe();
 
-        ColumnFamilyStore store = Keyspace.open(keyspaceName).getColumnFamilyStore(cfid);
+        ColumnFamilyStore store = Keyspace.open(keyspaceName).getColumnFamilyStore(tableId);
         store.forceBlockingFlush();
         return store;
     }
@@ -228,8 +235,9 @@ public class Util
     public static void compact(ColumnFamilyStore cfs, Collection<SSTableReader> sstables)
     {
         int gcBefore = cfs.gcBefore(FBUtilities.nowInSeconds());
-        AbstractCompactionTask task = cfs.getCompactionStrategyManager().getUserDefinedTask(sstables, gcBefore);
-        task.execute(null);
+        List<AbstractCompactionTask> tasks = cfs.getCompactionStrategyManager().getUserDefinedTasks(sstables, gcBefore);
+        for (AbstractCompactionTask task : tasks)
+            task.execute(null);
     }
 
     public static void expectEOF(Callable<?> callable)
@@ -256,7 +264,7 @@ public class Util
 
     public static AbstractReadCommandBuilder.SinglePartitionBuilder cmd(ColumnFamilyStore cfs, Object... partitionKey)
     {
-        return new AbstractReadCommandBuilder.SinglePartitionBuilder(cfs, makeKey(cfs.metadata, partitionKey));
+        return new AbstractReadCommandBuilder.SinglePartitionBuilder(cfs, makeKey(cfs.metadata(), partitionKey));
     }
 
     public static AbstractReadCommandBuilder.PartitionRangeBuilder cmd(ColumnFamilyStore cfs)
@@ -264,13 +272,13 @@ public class Util
         return new AbstractReadCommandBuilder.PartitionRangeBuilder(cfs);
     }
 
-    static DecoratedKey makeKey(CFMetaData metadata, Object... partitionKey)
+    static DecoratedKey makeKey(TableMetadata metadata, Object... partitionKey)
     {
         if (partitionKey.length == 1 && partitionKey[0] instanceof DecoratedKey)
             return (DecoratedKey)partitionKey[0];
 
-        ByteBuffer key = CFMetaData.serializePartitionKey(metadata.getKeyValidatorAsClusteringComparator().make(partitionKey));
-        return metadata.decorateKey(key);
+        ByteBuffer key = metadata.partitionKeyAsClusteringComparator().make(partitionKey).serializeAsPartitionKey();
+        return metadata.partitioner.decorateKey(key);
     }
 
     public static void assertEmptyUnfiltered(ReadCommand command)
@@ -282,7 +290,7 @@ public class Util
             {
                 try (UnfilteredRowIterator partition = iterator.next())
                 {
-                    throw new AssertionError("Expected no results for query " + command.toCQLString() + " but got key " + command.metadata().getKeyValidator().getString(partition.partitionKey().getKey()));
+                    throw new AssertionError("Expected no results for query " + command.toCQLString() + " but got key " + command.metadata().partitionKeyType.getString(partition.partitionKey().getKey()));
                 }
             }
         }
@@ -297,7 +305,7 @@ public class Util
             {
                 try (RowIterator partition = iterator.next())
                 {
-                    throw new AssertionError("Expected no results for query " + command.toCQLString() + " but got key " + command.metadata().getKeyValidator().getString(partition.partitionKey().getKey()));
+                    throw new AssertionError("Expected no results for query " + command.toCQLString() + " but got key " + command.metadata().partitionKeyType.getString(partition.partitionKey().getKey()));
                 }
             }
         }
@@ -409,7 +417,7 @@ public class Util
 
     public static Cell cell(ColumnFamilyStore cfs, Row row, String columnName)
     {
-        ColumnDefinition def = cfs.metadata.getColumnDefinition(ByteBufferUtil.bytes(columnName));
+        ColumnMetadata def = cfs.metadata().getColumn(ByteBufferUtil.bytes(columnName));
         assert def != null;
         return row.getCell(def);
     }
@@ -422,7 +430,7 @@ public class Util
     public static void assertCellValue(Object value, ColumnFamilyStore cfs, Row row, String columnName)
     {
         Cell cell = cell(cfs, row, columnName);
-        assert cell != null : "Row " + row.toString(cfs.metadata) + " has no cell for " + columnName;
+        assert cell != null : "Row " + row.toString(cfs.metadata()) + " has no cell for " + columnName;
         assertEquals(value, cell.column().type.compose(cell.value()));
     }
 
@@ -446,25 +454,38 @@ public class Util
         return size;
     }
 
-    public static CBuilder getCBuilderForCFM(CFMetaData cfm)
-    {
-        List<ColumnDefinition> clusteringColumns = cfm.clusteringColumns();
-        List<AbstractType<?>> types = new ArrayList<>(clusteringColumns.size());
-        for (ColumnDefinition def : clusteringColumns)
-            types.add(def.type);
-        return CBuilder.create(new ClusteringComparator(types));
-    }
-
     public static boolean equal(UnfilteredRowIterator a, UnfilteredRowIterator b)
     {
         return Objects.equals(a.columns(), b.columns())
-            && Objects.equals(a.metadata(), b.metadata())
+            && Objects.equals(a.stats(), b.stats())
+            && sameContent(a, b);
+    }
+
+    // Test equality of the iterators, but without caring too much about the "metadata" of said iterator. This is often
+    // what we want in tests. In particular, the columns() reported by the iterators will sometimes differ because they
+    // are a superset of what the iterator actually contains, and depending on the method used to get each iterator
+    // tested, one may include a defined column the other don't while there is not actual content for that column.
+    public static boolean sameContent(UnfilteredRowIterator a, UnfilteredRowIterator b)
+    {
+        return Objects.equals(a.metadata(), b.metadata())
             && Objects.equals(a.isReverseOrder(), b.isReverseOrder())
             && Objects.equals(a.partitionKey(), b.partitionKey())
             && Objects.equals(a.partitionLevelDeletion(), b.partitionLevelDeletion())
             && Objects.equals(a.staticRow(), b.staticRow())
-            && Objects.equals(a.stats(), b.stats())
             && Iterators.elementsEqual(a, b);
+    }
+
+    public static boolean sameContent(Mutation a, Mutation b)
+    {
+        if (!a.key().equals(b.key()) || !a.getTableIds().equals(b.getTableIds()))
+            return false;
+
+        for (PartitionUpdate update : a.getPartitionUpdates())
+        {
+            if (!sameContent(update.unfilteredIterator(), b.getPartitionUpdate(update.metadata()).unfilteredIterator()))
+                return false;
+        }
+        return true;
     }
 
     // moved & refactored from KeyspaceTest in < 3.0
@@ -485,9 +506,9 @@ public class Util
                         StringUtils.join(expectedColumnNames, ","));
     }
 
-    public static void assertColumn(CFMetaData cfm, Row row, String name, String value, long timestamp)
+    public static void assertColumn(TableMetadata cfm, Row row, String name, String value, long timestamp)
     {
-        Cell cell = row.getCell(cfm.getColumnDefinition(new ColumnIdentifier(name, true)));
+        Cell cell = row.getCell(cfm.getColumn(new ColumnIdentifier(name, true)));
         assertColumn(cell, value, timestamp);
     }
 
@@ -498,7 +519,7 @@ public class Util
         assertEquals(timestamp, cell.timestamp());
     }
 
-    public static void assertClustering(CFMetaData cfm, Row row, Object... clusteringValue)
+    public static void assertClustering(TableMetadata cfm, Row row, Object... clusteringValue)
     {
         assertEquals(row.clustering().size(), clusteringValue.length);
         assertEquals(0, cfm.comparator.compare(row.clustering(), cfm.comparator.make(clusteringValue)));
@@ -529,8 +550,8 @@ public class Util
 
     public static void spinAssertEquals(Object expected, Supplier<Object> s, int timeoutInSeconds)
     {
-        long now = System.currentTimeMillis();
-        while (System.currentTimeMillis() - now < now + (1000 * timeoutInSeconds))
+        long start = System.currentTimeMillis();
+        while (System.currentTimeMillis() < start + (1000 * timeoutInSeconds))
         {
             if (s.get().equals(expected))
                 break;
@@ -544,6 +565,63 @@ public class Util
         thread.join(10000);
     }
 
+    public static AssertionError runCatchingAssertionError(Runnable test)
+    {
+        try
+        {
+            test.run();
+            return null;
+        }
+        catch (AssertionError e)
+        {
+            return e;
+        }
+    }
+
+    /**
+     * Wrapper function used to run a test that can sometimes flake for uncontrollable reasons.
+     *
+     * If the given test fails on the first run, it is executed the given number of times again, expecting all secondary
+     * runs to succeed. If they do, the failure is understood as a flake and the test is treated as passing.
+     *
+     * Do not use this if the test is deterministic and its success is not influenced by external factors (such as time,
+     * selection of random seed, network failures, etc.). If the test can be made independent of such factors, it is
+     * probably preferable to do so rather than use this method.
+     *
+     * @param test The test to run.
+     * @param rerunsOnFailure How many times to re-run it if it fails. All reruns must pass.
+     * @param message Message to send to System.err on initial failure.
+     */
+    public static void flakyTest(Runnable test, int rerunsOnFailure, String message)
+    {
+        AssertionError e = runCatchingAssertionError(test);
+        if (e == null)
+            return;     // success
+
+        logger.info("Test failed. {}", message, e);
+        logger.info("Re-running {} times to verify it isn't failing more often than it should.", rerunsOnFailure);
+
+        int rerunsFailed = 0;
+        for (int i = 0; i < rerunsOnFailure; ++i)
+        {
+            AssertionError t = runCatchingAssertionError(test);
+            if (t != null)
+            {
+                ++rerunsFailed;
+                e.addSuppressed(t);
+
+                logger.debug("Test failed again, total num failures: {}", rerunsFailed, t);
+            }
+        }
+        if (rerunsFailed > 0)
+        {
+            logger.error("Test failed in {} of the {} reruns.", rerunsFailed, rerunsOnFailure);
+            throw e;
+        }
+
+        logger.info("All reruns succeeded. Failure treated as flake.");
+    }
+
     // for use with Optional in tests, can be used as an argument to orElseThrow
     public static Supplier<AssertionError> throwAssert(final String message)
     {
@@ -554,12 +632,12 @@ public class Util
     {
         Iterator<Unfiltered> content;
 
-        public UnfilteredSource(CFMetaData cfm, DecoratedKey partitionKey, Row staticRow, Iterator<Unfiltered> content)
+        public UnfilteredSource(TableMetadata metadata, DecoratedKey partitionKey, Row staticRow, Iterator<Unfiltered> content)
         {
-            super(cfm,
+            super(metadata,
                   partitionKey,
                   DeletionTime.LIVE,
-                  cfm.partitionColumns(),
+                  metadata.regularAndStaticColumns(),
                   staticRow != null ? staticRow : Rows.EMPTY_STATIC_ROW,
                   false,
                   EncodingStats.NO_STATS);
@@ -587,7 +665,6 @@ public class Util
         {
             super(original.isDigestQuery(),
                   original.digestVersion(),
-                  original.isForThrift(),
                   original.metadata(),
                   original.nowInSec(),
                   original.columnFilter(),
@@ -602,5 +679,41 @@ public class Util
         {
             return queryStorage(cfs, controller);
         }
+    }
+
+    public static Closeable markDirectoriesUnwriteable(ColumnFamilyStore cfs)
+    {
+        try
+        {
+            for ( ; ; )
+            {
+                DataDirectory dir = cfs.getDirectories().getWriteableLocation(1);
+                BlacklistedDirectories.maybeMarkUnwritable(cfs.getDirectories().getLocationForDisk(dir));
+            }
+        }
+        catch (IOError e)
+        {
+            // Expected -- marked all directories as unwritable
+        }
+        return () -> BlacklistedDirectories.clearUnwritableUnsafe();
+    }
+
+    public static PagingState makeSomePagingState(ProtocolVersion protocolVersion)
+    {
+        TableMetadata metadata =
+            TableMetadata.builder("ks", "tbl")
+                         .addPartitionKeyColumn("k", AsciiType.instance)
+                         .addClusteringColumn("c1", AsciiType.instance)
+                         .addClusteringColumn("c2", Int32Type.instance)
+                         .addRegularColumn("myCol", AsciiType.instance)
+                         .build();
+
+        ByteBuffer pk = ByteBufferUtil.bytes("someKey");
+
+        ColumnMetadata def = metadata.getColumn(new ColumnIdentifier("myCol", false));
+        Clustering c = Clustering.make(ByteBufferUtil.bytes("c1"), ByteBufferUtil.bytes(42));
+        Row row = BTreeRow.singleCellRow(c, BufferCell.live(def, 0, ByteBufferUtil.EMPTY_BYTE_BUFFER));
+        PagingState.RowMark mark = PagingState.RowMark.create(metadata, row, protocolVersion);
+        return new PagingState(pk, mark, 10, 0);
     }
 }

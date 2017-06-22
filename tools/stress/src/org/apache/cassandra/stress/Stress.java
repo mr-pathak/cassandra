@@ -21,10 +21,11 @@ import java.io.*;
 import java.net.Socket;
 import java.net.SocketException;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.stress.settings.StressSettings;
+import org.apache.cassandra.stress.util.MultiResultLogger;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.WindowsTimer;
-import org.apache.cassandra.stress.util.MultiPrintStream;
 
 public final class Stress
 {
@@ -55,12 +56,12 @@ public final class Stress
 
     public static void main(String[] arguments) throws Exception
     {
-        if (FBUtilities.isWindows())
+        if (FBUtilities.isWindows)
             WindowsTimer.startTimerPeriod(1);
 
         int exitCode = run(arguments);
 
-        if (FBUtilities.isWindows())
+        if (FBUtilities.isWindows)
             WindowsTimer.endTimerPeriod(1);
 
         System.exit(exitCode);
@@ -71,6 +72,8 @@ public final class Stress
     {
         try
         {
+            DatabaseDescriptor.clientInitialization();
+
             final StressSettings settings;
             try
             {
@@ -80,13 +83,20 @@ public final class Stress
             }
             catch (IllegalArgumentException e)
             {
-                System.out.printf("%s\n", e.getMessage());
+                System.out.printf("%s%n", e.getMessage());
                 printHelpMessage();
                 return 1;
             }
 
-            MultiPrintStream logout = settings.log.getOutput();
-            if (settings.graph.inGraphMode()) {
+            MultiResultLogger logout = settings.log.getOutput();
+
+            if (! settings.log.noSettings)
+            {
+                settings.printSettings(logout);
+            }
+
+            if (settings.graph.inGraphMode())
+            {
                 logout.addStream(new PrintStream(settings.graph.temporaryLogFile));
             }
 

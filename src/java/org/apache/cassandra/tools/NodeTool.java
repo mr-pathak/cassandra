@@ -64,6 +64,7 @@ public class NodeTool
                 Verify.class,
                 Flush.class,
                 UpgradeSSTable.class,
+                GarbageCollect.class,
                 DisableAutoCompaction.class,
                 EnableAutoCompaction.class,
                 CompactionStats.class,
@@ -75,7 +76,6 @@ public class NodeTool
                 EnableGossip.class,
                 DisableGossip.class,
                 EnableHandoff.class,
-                EnableThrift.class,
                 GcStats.class,
                 GetCompactionThreshold.class,
                 GetCompactionThroughput.class,
@@ -85,6 +85,7 @@ public class NodeTool
                 GetInterDCStreamThroughput.class,
                 GetEndpoints.class,
                 GetSSTables.class,
+                GetMaxHintWindow.class,
                 GossipInfo.class,
                 InvalidateKeyCache.class,
                 InvalidateRowCache.class,
@@ -99,21 +100,24 @@ public class NodeTool
                 RemoveNode.class,
                 Assassinate.class,
                 Repair.class,
+                RepairAdmin.class,
                 ReplayBatchlog.class,
                 SetCacheCapacity.class,
                 SetHintedHandoffThrottleInKB.class,
                 SetCompactionThreshold.class,
                 SetCompactionThroughput.class,
+                GetConcurrentCompactors.class,
+                SetConcurrentCompactors.class,
                 SetTimeout.class,
                 SetStreamThroughput.class,
                 SetInterDCStreamThroughput.class,
                 SetTraceProbability.class,
+                SetMaxHintWindow.class,
                 Snapshot.class,
                 ListSnapshots.class,
                 Status.class,
                 StatusBinary.class,
                 StatusGossip.class,
-                StatusThrift.class,
                 StatusBackup.class,
                 StatusHandoff.class,
                 Stop.class,
@@ -127,7 +131,6 @@ public class NodeTool
                 ResetLocalSchema.class,
                 ReloadTriggers.class,
                 SetCacheKeysToSave.class,
-                DisableThrift.class,
                 DisableHandoff.class,
                 Drain.class,
                 TruncateHints.class,
@@ -326,7 +329,7 @@ public class NodeTool
 
         protected List<String> parseOptionalKeyspace(List<String> cmdArgs, NodeProbe nodeProbe)
         {
-            return parseOptionalKeyspace(cmdArgs, nodeProbe, KeyspaceSet.NON_SYSTEM);
+            return parseOptionalKeyspace(cmdArgs, nodeProbe, KeyspaceSet.ALL);
         }
 
         protected List<String> parseOptionalKeyspace(List<String> cmdArgs, NodeProbe nodeProbe, KeyspaceSet defaultKeyspaceSet)

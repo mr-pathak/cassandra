@@ -19,19 +19,24 @@ package org.apache.cassandra.metrics;
 
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 
+import com.google.common.collect.Maps;
+
 import com.codahale.metrics.*;
 import com.codahale.metrics.Timer;
-import com.google.common.collect.Iterables;
-import com.google.common.collect.Maps;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.Memtable;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
+import org.apache.cassandra.index.SecondaryIndexManager;
 import org.apache.cassandra.io.compress.CompressionMetadata;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
 import org.apache.cassandra.utils.EstimatedHistogram;
 import org.apache.cassandra.utils.TopKSampler;
 
@@ -139,6 +144,24 @@ public class TableMetrics
     public final LatencyMetrics casPropose;
     /** CAS Commit metrics */
     public final LatencyMetrics casCommit;
+    /** percent of the data that is repaired */
+    public final Gauge<Double> percentRepaired;
+    /** time spent anticompacting data before participating in a consistent repair */
+    public final TableTimer anticompactionTime;
+    /** time spent creating merkle trees */
+    public final TableTimer validationTime;
+    /** time spent syncing data in a repair */
+    public final TableTimer syncTime;
+    /** approximate number of bytes read while creating merkle trees */
+    public final TableHistogram bytesValidated;
+    /** number of partitions read creating merkle trees */
+    public final TableHistogram partitionsValidated;
+    /** number of bytes read while doing anticompaction */
+    public final Counter bytesAnticompacted;
+    /** number of bytes where the whole sstable was contained in a repairing range so that we only mutated the repair status */
+    public final Counter bytesMutatedAnticompaction;
+    /** ratio of how much we anticompact vs how much we could mutate the repair status*/
+    public final Gauge<Double> mutatedAnticompactionGauge;
 
     public final Timer coordinatorReadLatency;
     public final Timer coordinatorScanLatency;
@@ -155,10 +178,47 @@ public class TableMetrics
     private static final MetricNameFactory globalAliasFactory = new AllTableMetricNameFactory("ColumnFamily");
 
     public final Counter speculativeRetries;
+    public final Counter speculativeFailedRetries;
+    public final Counter speculativeInsufficientReplicas;
+    public final Gauge<Long> speculativeSampleLatencyNanos;
 
     public final static LatencyMetrics globalReadLatency = new LatencyMetrics(globalFactory, globalAliasFactory, "Read");
     public final static LatencyMetrics globalWriteLatency = new LatencyMetrics(globalFactory, globalAliasFactory, "Write");
     public final static LatencyMetrics globalRangeLatency = new LatencyMetrics(globalFactory, globalAliasFactory, "Range");
+
+    public final static Gauge<Double> globalPercentRepaired = Metrics.register(globalFactory.createMetricName("PercentRepaired"),
+            new Gauge<Double>()
+    {
+        public Double getValue()
+        {
+            double repaired = 0;
+            double total = 0;
+            for (String keyspace : Schema.instance.getNonSystemKeyspaces())
+            {
+                Keyspace k = Schema.instance.getKeyspaceInstance(keyspace);
+                if (SchemaConstants.DISTRIBUTED_KEYSPACE_NAME.equals(k.getName()))
+                    continue;
+                if (k.getReplicationStrategy().getReplicationFactor() < 2)
+                    continue;
+
+                for (ColumnFamilyStore cf : k.getColumnFamilyStores())
+                {
+                    if (!SecondaryIndexManager.isIndexColumnFamily(cf.name))
+                    {
+                        for (SSTableReader sstable : cf.getSSTables(SSTableSet.CANONICAL))
+                        {
+                            if (sstable.isRepaired())
+                            {
+                                repaired += sstable.uncompressedLength();
+                            }
+                            total += sstable.uncompressedLength();
+                        }
+                    }
+                }
+            }
+            return total > 0 ? (repaired / total) * 100 : 100.0;
+        }
+    });
 
     public final Map<Sampler, TopKSampler<ByteBuffer>> samplers;
     /**
@@ -339,8 +399,26 @@ public class TableMetrics
         {
             public Double getValue()
             {
-                return computeCompressionRatio(Iterables.concat(Iterables.transform(Keyspace.all(),
-                                                                                    p -> p.getAllSSTables(SSTableSet.CANONICAL))));
+                List<SSTableReader> sstables = new ArrayList<>();
+                Keyspace.all().forEach(ks -> sstables.addAll(ks.getAllSSTables(SSTableSet.CANONICAL)));
+                return computeCompressionRatio(sstables);
+            }
+        });
+        percentRepaired = createTableGauge("PercentRepaired", new Gauge<Double>()
+        {
+            public Double getValue()
+            {
+                double repaired = 0;
+                double total = 0;
+                for (SSTableReader sstable : cfs.getSSTables(SSTableSet.CANONICAL))
+                {
+                    if (sstable.isRepaired())
+                    {
+                        repaired += sstable.uncompressedLength();
+                    }
+                    total += sstable.uncompressedLength();
+                }
+                return total > 0 ? (repaired / total) * 100 : 100.0;
             }
         });
         readLatency = new LatencyMetrics(factory, "Read", cfs.keyspace.metric.readLatency, globalReadLatency);
@@ -574,6 +652,15 @@ public class TableMetrics
             }
         });
         speculativeRetries = createTableCounter("SpeculativeRetries");
+        speculativeFailedRetries = createTableCounter("SpeculativeFailedRetries");
+        speculativeInsufficientReplicas = createTableCounter("SpeculativeInsufficientReplicas");
+        speculativeSampleLatencyNanos = createTableGauge("SpeculativeSampleLatencyNanos", new Gauge<Long>()
+        {
+            public Long getValue()
+            {
+                return cfs.sampleLatencyNanos;
+            }
+        });
         keyCacheHitRate = Metrics.register(factory.createMetricName("KeyCacheHitRate"),
                                            aliasFactory.createMetricName("KeyCacheHitRate"),
                                            new RatioGauge()
@@ -609,7 +696,7 @@ public class TableMetrics
 
         // We do not want to capture view mutation specific metrics for a view
         // They only makes sense to capture on the base table
-        if (cfs.metadata.isView())
+        if (cfs.metadata().isView())
         {
             viewLockAcquireTime = null;
             viewReadTime = null;
@@ -635,6 +722,23 @@ public class TableMetrics
         casPrepare = new LatencyMetrics(factory, "CasPrepare", cfs.keyspace.metric.casPrepare);
         casPropose = new LatencyMetrics(factory, "CasPropose", cfs.keyspace.metric.casPropose);
         casCommit = new LatencyMetrics(factory, "CasCommit", cfs.keyspace.metric.casCommit);
+
+        anticompactionTime = createTableTimer("AnticompactionTime", cfs.keyspace.metric.anticompactionTime);
+        validationTime = createTableTimer("ValidationTime", cfs.keyspace.metric.validationTime);
+        syncTime = createTableTimer("SyncTime", cfs.keyspace.metric.repairSyncTime);
+
+        bytesValidated = createTableHistogram("BytesValidated", cfs.keyspace.metric.bytesValidated, false);
+        partitionsValidated = createTableHistogram("PartitionsValidated", cfs.keyspace.metric.partitionsValidated, false);
+        bytesAnticompacted = createTableCounter("BytesAnticompacted");
+        bytesMutatedAnticompaction = createTableCounter("BytesMutatedAnticompaction");
+        mutatedAnticompactionGauge = createTableGauge("MutatedAnticompactionGauge", () ->
+        {
+            double bytesMutated = bytesMutatedAnticompaction.getCount();
+            double bytesAnticomp = bytesAnticompacted.getCount();
+            if (bytesAnticomp + bytesMutated > 0)
+                return bytesMutated / (bytesAnticomp + bytesMutated);
+            return 0.0;
+        });
     }
 
     public void updateSSTableIterated(int count)
@@ -651,8 +755,12 @@ public class TableMetrics
         {
             CassandraMetricsRegistry.MetricName name = factory.createMetricName(entry.getKey());
             CassandraMetricsRegistry.MetricName alias = aliasFactory.createMetricName(entry.getValue());
-            allTableMetrics.get(entry.getKey()).remove(Metrics.getMetrics().get(name.getMetricName()));
-            Metrics.remove(name, alias);
+            final Metric metric = Metrics.getMetrics().get(name.getMetricName());
+            if (metric != null)
+            {   // Metric will be null if it's a view metric we are releasing. Views have null for ViewLockAcquireTime and ViewLockReadTime
+                allTableMetrics.get(entry.getKey()).remove(metric);
+                Metrics.remove(name, alias);
+            }
         }
         readLatency.release();
         writeLatency.release();
@@ -761,7 +869,7 @@ public class TableMetrics
                 dataLengthSum += compressionMetadata.dataLength;
             }
         }
-        return dataLengthSum != 0 ? compressedLengthSum / dataLengthSum : 0;
+        return dataLengthSum != 0 ? compressedLengthSum / dataLengthSum : MetadataCollector.NO_COMPRESSION_RATIO;
     }
 
     /**
@@ -805,7 +913,7 @@ public class TableMetrics
      */
     private boolean register(String name, String alias, Metric metric)
     {
-        boolean ret = allTableMetrics.putIfAbsent(name,  new HashSet<>()) == null;
+        boolean ret = allTableMetrics.putIfAbsent(name, ConcurrentHashMap.newKeySet()) == null;
         allTableMetrics.get(name).add(metric);
         all.put(name, alias);
         return ret;
@@ -845,6 +953,30 @@ public class TableMetrics
             for(Timer timer : all)
             {
                 timer.update(i, unit);
+            }
+        }
+
+        public Context time()
+        {
+            return new Context(all);
+        }
+
+        public static class Context implements AutoCloseable
+        {
+            private final long start;
+            private final Timer [] all;
+
+            private Context(Timer [] all)
+            {
+                this.all = all;
+                start = System.nanoTime();
+            }
+
+            public void close()
+            {
+                long duration = System.nanoTime() - start;
+                for (Timer t : all)
+                    t.update(duration, TimeUnit.NANOSECONDS);
             }
         }
     }
@@ -893,7 +1025,7 @@ public class TableMetrics
             String groupName = TableMetrics.class.getPackage().getName();
             StringBuilder mbeanName = new StringBuilder();
             mbeanName.append(groupName).append(":");
-            mbeanName.append("type=" + type);
+            mbeanName.append("type=").append(type);
             mbeanName.append(",name=").append(metricName);
             return new CassandraMetricsRegistry.MetricName(groupName, type, metricName, "all", mbeanName.toString());
         }

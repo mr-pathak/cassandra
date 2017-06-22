@@ -22,10 +22,9 @@ import java.io.IOException;
 
 import com.google.common.base.Throwables;
 
-import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
-import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.schema.TableMetadataRef;
 
 /**
  * A SSTable writer that assumes rows are in (partitioner) sorted order.
@@ -44,7 +43,7 @@ class SSTableSimpleWriter extends AbstractSSTableSimpleWriter
 
     private SSTableTxnWriter writer;
 
-    protected SSTableSimpleWriter(File directory, CFMetaData metadata, PartitionColumns columns)
+    protected SSTableSimpleWriter(File directory, TableMetadataRef metadata, RegularAndStaticColumns columns)
     {
         super(directory, metadata, columns);
     }
@@ -68,7 +67,7 @@ class SSTableSimpleWriter extends AbstractSSTableSimpleWriter
             if (update != null)
                 writePartition(update);
             currentKey = key;
-            update = new PartitionUpdate(metadata, currentKey, columns, 4);
+            update = new PartitionUpdate(metadata.get(), currentKey, columns, 4);
         }
 
         assert update != null;

@@ -18,27 +18,27 @@
 
 package org.apache.cassandra.serializers;
 
-import org.apache.cassandra.transport.Server;
-
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.transport.ProtocolVersion;
 
 public class ListSerializer<T> extends CollectionSerializer<List<T>>
 {
     // interning instances
-    private static final Map<TypeSerializer<?>, ListSerializer> instances = new HashMap<TypeSerializer<?>, ListSerializer>();
+    private static final ConcurrentMap<TypeSerializer<?>, ListSerializer> instances = new ConcurrentHashMap<TypeSerializer<?>, ListSerializer>();
 
     public final TypeSerializer<T> elements;
 
-    public static synchronized <T> ListSerializer<T> getInstance(TypeSerializer<T> elements)
+    public static <T> ListSerializer<T> getInstance(TypeSerializer<T> elements)
     {
         ListSerializer<T> t = instances.get(elements);
         if (t == null)
-        {
-            t = new ListSerializer<T>(elements);
-            instances.put(elements, t);
-        }
+            t = instances.computeIfAbsent(elements, k -> new ListSerializer<>(k) );
         return t;
     }
 
@@ -60,7 +60,7 @@ public class ListSerializer<T> extends CollectionSerializer<List<T>>
         return value.size();
     }
 
-    public void validateForNativeProtocol(ByteBuffer bytes, int version)
+    public void validateForNativeProtocol(ByteBuffer bytes, ProtocolVersion version)
     {
         try
         {
@@ -78,13 +78,21 @@ public class ListSerializer<T> extends CollectionSerializer<List<T>>
         }
     }
 
-    public List<T> deserializeForNativeProtocol(ByteBuffer bytes, int version)
+    public List<T> deserializeForNativeProtocol(ByteBuffer bytes, ProtocolVersion version)
     {
         try
         {
             ByteBuffer input = bytes.duplicate();
             int n = readCollectionSize(input, version);
-            List<T> l = new ArrayList<T>(n);
+
+            if (n < 0)
+                throw new MarshalException("The data cannot be deserialized as a list");
+
+            // If the received bytes are not corresponding to a list, n might be a huge number.
+            // In such a case we do not want to initialize the list with that size as it can result
+            // in an OOM (see CASSANDRA-12618). On the other hand we do not want to have to resize the list
+            // if we can avoid it, so we put a reasonable limit on the initialCapacity.
+            List<T> l = new ArrayList<T>(Math.min(n, 256));
             for (int i = 0; i < n; i++)
             {
                 // We can have nulls in lists that are used for IN values
@@ -122,7 +130,7 @@ public class ListSerializer<T> extends CollectionSerializer<List<T>>
         try
         {
             ByteBuffer input = serializedList.duplicate();
-            int n = readCollectionSize(input, Server.VERSION_3);
+            int n = readCollectionSize(input, ProtocolVersion.V3);
             if (n <= index)
                 return null;
 
@@ -131,7 +139,7 @@ public class ListSerializer<T> extends CollectionSerializer<List<T>>
                 int length = input.getInt();
                 input.position(input.position() + length);
             }
-            return readValue(input, Server.VERSION_3);
+            return readValue(input, ProtocolVersion.V3);
         }
         catch (BufferUnderflowException e)
         {
@@ -159,5 +167,17 @@ public class ListSerializer<T> extends CollectionSerializer<List<T>>
     public Class<List<T>> getType()
     {
         return (Class) List.class;
+    }
+
+    public ByteBuffer getSerializedValue(ByteBuffer collection, ByteBuffer key, AbstractType<?> comparator)
+    {
+        // We don't allow selecting an element of a list so we don't need this.
+        throw new UnsupportedOperationException();
+    }
+
+    public ByteBuffer getSliceFromSerialized(ByteBuffer collection, ByteBuffer from, ByteBuffer to, AbstractType<?> comparator)
+    {
+        // We don't allow slicing of list so we don't need this.
+        throw new UnsupportedOperationException();
     }
 }

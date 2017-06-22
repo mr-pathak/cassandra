@@ -18,10 +18,7 @@
 package org.apache.cassandra.cql3;
 
 import java.nio.ByteBuffer;
-import java.util.Collections;
 import java.util.List;
-
-import com.google.common.collect.Iterables;
 
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.db.LivenessInfo;
@@ -102,7 +99,7 @@ public class Attributes
 
         ByteBuffer tval = timeToLive.bindAndGet(options);
         if (tval == null)
-            throw new InvalidRequestException("Invalid null value of TTL");
+            return 0;
 
         if (tval == ByteBufferUtil.UNSET_BYTE_BUFFER)
             return defaultTimeToLive;

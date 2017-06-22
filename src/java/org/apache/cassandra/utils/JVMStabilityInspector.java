@@ -81,7 +81,8 @@ public final class JVMStabilityInspector
         {
             logger.error("Exiting due to error while processing commit log during initialization.", t);
             killer.killCurrentJVM(t, true);
-        } else if (DatabaseDescriptor.getCommitFailurePolicy() == Config.CommitFailurePolicy.die)
+        }
+        else if (DatabaseDescriptor.getCommitFailurePolicy() == Config.CommitFailurePolicy.die)
             killer.killCurrentJVM(t);
         else
             inspectThrowable(t);
@@ -110,7 +111,8 @@ public final class JVMStabilityInspector
     }
 
     @VisibleForTesting
-    public static Killer replaceKiller(Killer newKiller) {
+    public static Killer replaceKiller(Killer newKiller)
+    {
         Killer oldKiller = JVMStabilityInspector.killer;
         JVMStabilityInspector.killer = newKiller;
         return oldKiller;

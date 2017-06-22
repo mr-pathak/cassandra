@@ -47,7 +47,6 @@ public class Info extends NodeToolCmd
 
         System.out.printf("%-23s: %s%n", "ID", probe.getLocalHostId());
         System.out.printf("%-23s: %s%n", "Gossip active", gossipInitialized);
-        System.out.printf("%-23s: %s%n", "Thrift active", probe.isThriftServerRunning());
         System.out.printf("%-23s: %s%n", "Native Transport active", probe.isNativeTransportRunning());
         System.out.printf("%-23s: %s%n", "Load", probe.getLoadString());
         if (gossipInitialized)
@@ -139,6 +138,9 @@ public class Info extends NodeToolCmd
             // Chunk cache is not on.
         }
 
+        // Global table stats
+        System.out.printf("%-23s: %s%%%n", "Percent Repaired", probe.getColumnFamilyMetric(null, null, "PercentRepaired"));
+
         // check if node is already joined, before getting tokens, since it throws exception if not.
         if (probe.isJoined())
         {
@@ -171,7 +173,7 @@ public class Info extends NodeToolCmd
         {
             Entry<String, ColumnFamilyStoreMBean> entry = cfamilies.next();
             String keyspaceName = entry.getKey();
-            String cfName = entry.getValue().getColumnFamilyName();
+            String cfName = entry.getValue().getTableName();
 
             offHeapMemUsedInBytes += (Long) probe.getColumnFamilyMetric(keyspaceName, cfName, "MemtableOffHeapSize");
             offHeapMemUsedInBytes += (Long) probe.getColumnFamilyMetric(keyspaceName, cfName, "BloomFilterOffHeapMemoryUsed");

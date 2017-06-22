@@ -40,7 +40,7 @@ public class IncomingStreamingConnection extends Thread implements Closeable
     private static final Logger logger = LoggerFactory.getLogger(IncomingStreamingConnection.class);
 
     private final int version;
-    private final Socket socket;
+    public final Socket socket;
     private final Set<Closeable> group;
 
     public IncomingStreamingConnection(int version, Socket socket, Set<Closeable> group)
@@ -73,13 +73,11 @@ public class IncomingStreamingConnection extends Thread implements Closeable
             // The receiving side distinguish two connections by looking at StreamInitMessage#isForOutgoing.
             // Note: we cannot use the same socket for incoming and outgoing streams because we want to
             // parallelize said streams and the socket is blocking, so we might deadlock.
-            StreamResultFuture.initReceivingSide(init.sessionIndex, init.planId, init.description, init.from, socket, init.isForOutgoing, version, init.keepSSTableLevel, init.isIncremental);
+            StreamResultFuture.initReceivingSide(init.sessionIndex, init.planId, init.streamOperation, init.from, this, init.isForOutgoing, version, init.keepSSTableLevel, init.pendingRepair, init.previewKind);
         }
-        catch (IOException e)
+        catch (Throwable t)
         {
-            logger.error(String.format("IOException while reading from socket from %s, closing: %s",
-                                       socket.getRemoteSocketAddress(), e));
-            logger.trace(String.format("IOException while reading from socket from %s, closing", socket.getRemoteSocketAddress()), e);
+            logger.error("Error while reading from socket from {}.", socket.getRemoteSocketAddress(), t);
             close();
         }
     }
@@ -96,7 +94,7 @@ public class IncomingStreamingConnection extends Thread implements Closeable
         }
         catch (IOException e)
         {
-            logger.trace("Error closing socket", e);
+            logger.debug("Error closing socket", e);
         }
         finally
         {

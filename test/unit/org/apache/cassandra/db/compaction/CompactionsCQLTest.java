@@ -50,7 +50,7 @@ public class CompactionsCQLTest extends CQLTester
     @Test
     public void testTriggerMinorCompactionLCS() throws Throwable
     {
-        createTable("CREATE TABLE %s (id text PRIMARY KEY) WITH compaction = {'class':'LeveledCompactionStrategy', 'sstable_size_in_mb':1};");
+        createTable("CREATE TABLE %s (id text PRIMARY KEY) WITH compaction = {'class':'LeveledCompactionStrategy', 'sstable_size_in_mb':1, 'fanout_size':5};");
         assertTrue(getCurrentColumnFamilyStore().getCompactionStrategyManager().isEnabled());
         execute("insert into %s (id) values ('1')");
         flush();
@@ -65,12 +65,25 @@ public class CompactionsCQLTest extends CQLTester
     {
         createTable("CREATE TABLE %s (id text PRIMARY KEY) WITH compaction = {'class':'DateTieredCompactionStrategy', 'min_threshold':2};");
         assertTrue(getCurrentColumnFamilyStore().getCompactionStrategyManager().isEnabled());
+        execute("insert into %s (id) values ('1') using timestamp 1000"); // same timestamp = same window = minor compaction triggered
+        flush();
+        execute("insert into %s (id) values ('1') using timestamp 1000");
+        flush();
+        waitForMinor(KEYSPACE, currentTable(), SLEEP_TIME, true);
+    }
+
+    @Test
+    public void testTriggerMinorCompactionTWCS() throws Throwable
+    {
+        createTable("CREATE TABLE %s (id text PRIMARY KEY) WITH compaction = {'class':'TimeWindowCompactionStrategy', 'min_threshold':2};");
+        assertTrue(getCurrentColumnFamilyStore().getCompactionStrategyManager().isEnabled());
         execute("insert into %s (id) values ('1')");
         flush();
         execute("insert into %s (id) values ('1')");
         flush();
         waitForMinor(KEYSPACE, currentTable(), SLEEP_TIME, true);
     }
+
 
     @Test
     public void testTriggerNoMinorCompactionSTCSDisabled() throws Throwable

@@ -57,7 +57,7 @@ public final class FileUtils
     private static final double TB = 1024*1024*1024*1024d;
 
     private static final DecimalFormat df = new DecimalFormat("#.##");
-    private static final boolean canCleanDirectBuffers;
+    public static final boolean isCleanerAvailable;
     private static final AtomicReference<Optional<FSErrorHandler>> fsErrorHandler = new AtomicReference<>(Optional.empty());
 
     static
@@ -74,7 +74,7 @@ public final class FileUtils
             JVMStabilityInspector.inspectThrowable(t);
             logger.info("Cannot initialize un-mmaper.  (Are you using a non-Oracle JVM?)  Compacted data files will not be removed promptly.  Consider using an Oracle JVM or using standard disk access mode");
         }
-        canCleanDirectBuffers = canClean;
+        isCleanerAvailable = canClean;
     }
 
     public static void createHardLink(String from, String to)
@@ -176,7 +176,7 @@ public final class FileUtils
     {
         assert from.exists();
         if (logger.isTraceEnabled())
-            logger.trace((String.format("Renaming %s to %s", from.getPath(), to.getPath())));
+            logger.trace("Renaming {} to {}", from.getPath(), to.getPath());
         // this is not FSWE because usually when we see it it's because we didn't close the file before renaming it,
         // and Windows is picky about that.
         try
@@ -334,16 +334,11 @@ public final class FileUtils
         }
     }
 
-    public static boolean isCleanerAvailable()
-    {
-        return canCleanDirectBuffers;
-    }
-
     public static void clean(ByteBuffer buffer)
     {
         if (buffer == null)
             return;
-        if (isCleanerAvailable() && buffer.isDirect())
+        if (isCleanerAvailable && buffer.isDirect())
         {
             DirectBuffer db = (DirectBuffer) buffer;
             if (db.cleaner() != null)
@@ -456,7 +451,7 @@ public final class FileUtils
                 deleteRecursiveOnExit(new File(dir, child));
         }
 
-        logger.trace("Scheduling deferred deletion of file: " + dir);
+        logger.trace("Scheduling deferred deletion of file: {}", dir);
         dir.deleteOnExit();
     }
 

@@ -18,8 +18,6 @@
 package org.apache.cassandra.db.marshal;
 
 import java.nio.ByteBuffer;
-import java.nio.charset.CharacterCodingException;
-import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -30,7 +28,8 @@ import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.CellPath;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.SyntaxException;
-import org.apache.cassandra.serializers.*;
+import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Pair;
 import org.slf4j.Logger;
@@ -47,11 +46,11 @@ public class UserType extends TupleType
 
     public final String keyspace;
     public final ByteBuffer name;
-    private final List<ByteBuffer> fieldNames;
+    private final List<FieldIdentifier> fieldNames;
     private final List<String> stringFieldNames;
     private final boolean isMultiCell;
 
-    public UserType(String keyspace, ByteBuffer name, List<ByteBuffer> fieldNames, List<AbstractType<?>> fieldTypes, boolean isMultiCell)
+    public UserType(String keyspace, ByteBuffer name, List<FieldIdentifier> fieldNames, List<AbstractType<?>> fieldTypes, boolean isMultiCell)
     {
         super(fieldTypes, false);
         assert fieldNames.size() == fieldTypes.size();
@@ -61,17 +60,8 @@ public class UserType extends TupleType
         this.stringFieldNames = new ArrayList<>(fieldNames.size());
         this.isMultiCell = isMultiCell;
 
-        for (ByteBuffer fieldName : fieldNames)
-        {
-            try
-            {
-                stringFieldNames.add(ByteBufferUtil.string(fieldName, StandardCharsets.UTF_8));
-            }
-            catch (CharacterCodingException ex)
-            {
-                throw new AssertionError("Got non-UTF8 field name for user-defined type: " + ByteBufferUtil.bytesToHex(fieldName), ex);
-            }
-        }
+        for (FieldIdentifier fieldName : fieldNames)
+            stringFieldNames.add(fieldName.toString());
     }
 
     public static UserType getInstance(TypeParser parser) throws ConfigurationException, SyntaxException
@@ -79,11 +69,11 @@ public class UserType extends TupleType
         Pair<Pair<String, ByteBuffer>, List<Pair<ByteBuffer, AbstractType>>> params = parser.getUserTypeParameters();
         String keyspace = params.left.left;
         ByteBuffer name = params.left.right;
-        List<ByteBuffer> columnNames = new ArrayList<>(params.right.size());
+        List<FieldIdentifier> columnNames = new ArrayList<>(params.right.size());
         List<AbstractType<?>> columnTypes = new ArrayList<>(params.right.size());
         for (Pair<ByteBuffer, AbstractType> p : params.right)
         {
-            columnNames.add(p.left);
+            columnNames.add(new FieldIdentifier(p.left));
             columnTypes.add(p.right);
         }
 
@@ -94,6 +84,11 @@ public class UserType extends TupleType
     public boolean isUDT()
     {
         return true;
+    }
+
+    public boolean isTuple()
+    {
+        return false;
     }
 
     @Override
@@ -118,7 +113,7 @@ public class UserType extends TupleType
         return types;
     }
 
-    public ByteBuffer fieldName(int i)
+    public FieldIdentifier fieldName(int i)
     {
         return fieldNames.get(i);
     }
@@ -128,7 +123,7 @@ public class UserType extends TupleType
         return stringFieldNames.get(i);
     }
 
-    public List<ByteBuffer> fieldNames()
+    public List<FieldIdentifier> fieldNames()
     {
         return fieldNames;
     }
@@ -138,23 +133,15 @@ public class UserType extends TupleType
         return UTF8Type.instance.compose(name);
     }
 
-    public short fieldPosition(ColumnIdentifier field)
+    public int fieldPosition(FieldIdentifier fieldName)
     {
-        return fieldPosition(field.bytes);
+        return fieldNames.indexOf(fieldName);
     }
 
-    public short fieldPosition(ByteBuffer fieldName)
-    {
-        for (short i = 0; i < fieldNames.size(); i++)
-            if (fieldName.equals(fieldNames.get(i)))
-                return i;
-        return -1;
-    }
-
-    public CellPath cellPathForField(ByteBuffer fieldName)
+    public CellPath cellPathForField(FieldIdentifier fieldName)
     {
         // we use the field position instead of the field name to allow for field renaming in ALTER TYPE statements
-        return CellPath.create(ByteBufferUtil.bytes(fieldPosition(fieldName)));
+        return CellPath.create(ByteBufferUtil.bytes((short)fieldPosition(fieldName)));
     }
 
     public ShortType nameComparator()
@@ -162,7 +149,7 @@ public class UserType extends TupleType
         return ShortType.instance;
     }
 
-    public ByteBuffer serializeForNativeProtocol(Iterator<Cell> cells, int protocolVersion)
+    public ByteBuffer serializeForNativeProtocol(Iterator<Cell> cells, ProtocolVersion protocolVersion)
     {
         assert isMultiCell;
 
@@ -187,6 +174,21 @@ public class UserType extends TupleType
         return TupleType.buildValue(components);
     }
 
+    public void validateCell(Cell cell) throws MarshalException
+    {
+        if (isMultiCell)
+        {
+            ByteBuffer path = cell.path().get(0);
+            nameComparator().validate(path);
+            Short fieldPosition = nameComparator().getSerializer().deserialize(path);
+            fieldType(fieldPosition).validate(cell.value());
+        }
+        else
+        {
+            validate(cell.value());
+        }
+    }
+
     // Note: the only reason we override this is to provide nicer error message, but since that's not that much code...
     @Override
     public void validate(ByteBuffer bytes) throws MarshalException
@@ -199,7 +201,7 @@ public class UserType extends TupleType
                 return;
 
             if (input.remaining() < 4)
-                throw new MarshalException(String.format("Not enough bytes to read size of %dth field %s", i, fieldName(i)));
+                throw new MarshalException(String.format("Not enough bytes to read size of %dth field %s", i, fieldNameAsString(i)));
 
             int size = input.getInt();
 
@@ -208,7 +210,7 @@ public class UserType extends TupleType
                 continue;
 
             if (input.remaining() < size)
-                throw new MarshalException(String.format("Not enough bytes to read %dth field %s", i, fieldName(i)));
+                throw new MarshalException(String.format("Not enough bytes to read %dth field %s", i, fieldNameAsString(i)));
 
             ByteBuffer field = ByteBufferUtil.readBytes(input, size);
             types.get(i).validate(field);
@@ -268,7 +270,7 @@ public class UserType extends TupleType
     }
 
     @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         ByteBuffer[] buffers = split(buffer);
         StringBuilder sb = new StringBuilder("{");
@@ -304,8 +306,11 @@ public class UserType extends TupleType
     }
 
     @Override
-    public AbstractType<?> freezeNestedUDTs()
+    public AbstractType<?> freezeNestedMulticellTypes()
     {
+        if (!isMultiCell())
+            return this;
+
         // the behavior here doesn't exactly match the method name: we want to freeze everything inside of UDTs
         List<AbstractType<?>> newTypes = fieldTypes().stream()
                 .map(subtype -> (subtype.isFreezable() && subtype.isMultiCell() ? subtype.freeze() : subtype))
@@ -395,6 +400,12 @@ public class UserType extends TupleType
     }
 
     @Override
+    public boolean referencesDuration()
+    {
+        return fieldTypes().stream().anyMatch(f -> f.referencesDuration());
+    }
+
+    @Override
     public String toString()
     {
         return this.toString(false);
@@ -413,5 +424,10 @@ public class UserType extends TupleType
         if (includeFrozenType)
             sb.append(")");
         return sb.toString();
+    }
+
+    public String toCQLString()
+    {
+        return String.format("%s.%s", ColumnIdentifier.maybeQuote(keyspace), ColumnIdentifier.maybeQuote(getNameAsString()));
     }
 }

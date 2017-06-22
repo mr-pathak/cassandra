@@ -23,11 +23,13 @@ import java.security.MessageDigest;
 import java.util.*;
 
 import org.apache.cassandra.cache.IMeasurableMemory;
-import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.*;
+import org.apache.cassandra.db.marshal.CompositeType;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 /**
@@ -235,8 +237,24 @@ public interface ClusteringPrefix extends IMeasurableMemory, Clusterable
      * @param metadata the metadata for the table the clustering prefix is of.
      * @return a human-readable string representation fo this prefix.
      */
-    public String toString(CFMetaData metadata);
+    public String toString(TableMetadata metadata);
 
+    /*
+     * TODO: we should stop using Clustering for partition keys. Maybe we can add
+     * a few methods to DecoratedKey so we don't have to (note that while using a Clustering
+     * allows to use buildBound(), it's actually used for partition keys only when every restriction
+     * is an equal, so we could easily create a specific method for keys for that.
+     */
+    default ByteBuffer serializeAsPartitionKey()
+    {
+        if (size() == 1)
+            return get(0);
+
+        ByteBuffer[] values = new ByteBuffer[size()];
+        for (int i = 0; i < size(); i++)
+            values[i] = get(i);
+        return CompositeType.build(values);
+    }
     /**
      * The values of this prefix as an array.
      * <p>
@@ -356,7 +374,7 @@ public interface ClusteringPrefix extends IMeasurableMemory, Clusterable
                 {
                     values[offset] = isNull(header, offset)
                                 ? null
-                                : (isEmpty(header, offset) ? ByteBufferUtil.EMPTY_BYTE_BUFFER : types.get(offset).readValue(in));
+                                : (isEmpty(header, offset) ? ByteBufferUtil.EMPTY_BYTE_BUFFER : types.get(offset).readValue(in, DatabaseDescriptor.getMaxValueSize()));
                     offset++;
                 }
             }
@@ -449,7 +467,9 @@ public interface ClusteringPrefix extends IMeasurableMemory, Clusterable
 
         public void prepare(int flags, int extendedFlags) throws IOException
         {
-            assert !UnfilteredSerializer.isStatic(extendedFlags) : "Flags = " + flags;
+            if (UnfilteredSerializer.isStatic(extendedFlags))
+                throw new IOException("Corrupt flags value for clustering prefix (isStatic flag set): " + flags);
+
             this.nextIsRow = UnfilteredSerializer.kind(flags) == Unfiltered.Kind.ROW;
             this.nextKind = nextIsRow ? Kind.CLUSTERING : ClusteringPrefix.Kind.values()[in.readByte()];
             this.nextSize = nextIsRow ? comparator.size() : in.readUnsignedShort();
@@ -480,7 +500,7 @@ public interface ClusteringPrefix extends IMeasurableMemory, Clusterable
             }
 
             if (bound.size() == nextSize)
-                return nextKind.compareTo(bound.kind());
+                return Kind.compare(nextKind, bound.kind());
 
             // We know that we'll have exited already if nextSize < bound.size
             return -bound.kind().comparedToClustering;
@@ -508,7 +528,7 @@ public interface ClusteringPrefix extends IMeasurableMemory, Clusterable
             int i = deserializedSize++;
             nextValues[i] = Serializer.isNull(nextHeader, i)
                           ? null
-                          : (Serializer.isEmpty(nextHeader, i) ? ByteBufferUtil.EMPTY_BYTE_BUFFER : serializationHeader.clusteringTypes().get(i).readValue(in));
+                          : (Serializer.isEmpty(nextHeader, i) ? ByteBufferUtil.EMPTY_BYTE_BUFFER : serializationHeader.clusteringTypes().get(i).readValue(in, DatabaseDescriptor.getMaxValueSize()));
             return true;
         }
 

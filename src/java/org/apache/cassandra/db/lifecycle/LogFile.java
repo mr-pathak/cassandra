@@ -1,3 +1,23 @@
+/*
+ *
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ *
+ */
 package org.apache.cassandra.db.lifecycle;
 
 import java.io.File;
@@ -32,7 +52,7 @@ import static org.apache.cassandra.utils.Throwables.merge;
  *
  * @see LogTransaction
  */
-final class LogFile
+final class LogFile implements AutoCloseable
 {
     private static final Logger logger = LoggerFactory.getLogger(LogFile.class);
 
@@ -93,6 +113,12 @@ final class LogFile
     {
         try
         {
+            // we sync the parent directories before content deletion to ensure
+            // any previously deleted files (see SSTableTider) are not
+            // incorrectly picked up by record.getExistingFiles() in
+            // deleteRecordFiles(), see CASSANDRA-12261
+            Throwables.maybeFail(syncDirectory(accumulate));
+
             deleteFilesForRecordsOfType(committed() ? Type.REMOVE : Type.ADD);
 
             // we sync the parent directories between contents and log deletion
@@ -161,10 +187,9 @@ final class LogFile
 
         // if only the last record is corrupt and all other records have matching files on disk, @see verifyRecord,
         // then we simply exited whilst serializing the last record and we carry on
-        logger.warn(String.format("Last record of transaction %s is corrupt or incomplete [%s], " +
-                                  "but all previous records match state on disk; continuing",
-                                  id,
-                                  failedOn.error()));
+        logger.warn("Last record of transaction {} is corrupt or incomplete [{}], " +
+                    "but all previous records match state on disk; continuing",
+                    id, failedOn.error());
         return true;
     }
 
@@ -195,7 +220,7 @@ final class LogFile
         // it matches. Because we delete files from oldest to newest, the latest update time should
         // always match.
         record.status.onDiskRecord = record.withExistingFiles();
-        if (record.updateTime != record.status.onDiskRecord.updateTime && record.status.onDiskRecord.numFiles > 0)
+        if (record.updateTime != record.status.onDiskRecord.updateTime && record.status.onDiskRecord.updateTime > 0)
         {
             record.setError(String.format("Unexpected files detected for sstable [%s]: " +
                                           "last update time [%tT] should have been [%tT]",
@@ -351,7 +376,7 @@ final class LogFile
         return replicas.exists();
     }
 
-    void close()
+    public void close()
     {
         replicas.close();
     }

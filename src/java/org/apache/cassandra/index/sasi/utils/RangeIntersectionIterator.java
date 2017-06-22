@@ -59,10 +59,13 @@ public class RangeIntersectionIterator
 
         protected RangeIterator<K, D> buildIterator()
         {
-            // if the range is disjoint we can simply return empty
-            // iterator of any type, because it's not going to produce any results.
+            // if the range is disjoint or we have an intersection with an empty set,
+            // we can simply return an empty iterator, because it's not going to produce any results.
             if (statistics.isDisjoint())
-                return new BounceIntersectionIterator<>(statistics, new PriorityQueue<RangeIterator<K, D>>(1));
+                return new EmptyRangeIterator<>();
+
+            if (rangeCount() == 1)
+                return ranges.poll();
 
             switch (strategy)
             {
@@ -124,6 +127,8 @@ public class RangeIntersectionIterator
 
         protected D computeNext()
         {
+            List<RangeIterator<K, D>> processed = null;
+
             while (!ranges.isEmpty())
             {
                 RangeIterator<K, D> head = ranges.poll();
@@ -139,7 +144,8 @@ public class RangeIntersectionIterator
                     return endOfData();
                 }
 
-                List<RangeIterator<K, D>> processed = new ArrayList<>();
+                if (processed == null)
+                    processed = new ArrayList<>();
 
                 boolean intersectsAll = true, exhausted = false;
                 while (!ranges.isEmpty())
@@ -180,8 +186,8 @@ public class RangeIntersectionIterator
 
                 ranges.add(head);
 
-                for (RangeIterator<K, D> range : processed)
-                    ranges.add(range);
+                ranges.addAll(processed);
+                processed.clear();
 
                 if (exhausted)
                     return endOfData();

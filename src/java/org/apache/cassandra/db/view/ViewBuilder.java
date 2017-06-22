@@ -20,8 +20,10 @@ package org.apache.cassandra.db.view;
 
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import javax.annotation.Nullable;
 
@@ -45,8 +47,6 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.repair.SystemDistributedKeyspace;
 import org.apache.cassandra.service.StorageProxy;
 import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.service.pager.QueryPager;
-import org.apache.cassandra.transport.Server;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.UUIDGen;
@@ -72,80 +72,73 @@ public class ViewBuilder extends CompactionInfo.Holder
 
     private void buildKey(DecoratedKey key)
     {
-        AtomicLong noBase = new AtomicLong(Long.MAX_VALUE);
         ReadQuery selectQuery = view.getReadQuery();
+
         if (!selectQuery.selectsKey(key))
+        {
+            logger.trace("Skipping {}, view query filters", key);
             return;
+        }
 
         int nowInSec = FBUtilities.nowInSeconds();
         SinglePartitionReadCommand command = view.getSelectStatement().internalReadForView(key, nowInSec);
 
         // We're rebuilding everything from what's on disk, so we read everything, consider that as new updates
         // and pretend that there is nothing pre-existing.
-        UnfilteredRowIterator empty = UnfilteredRowIterators.noRowsIterator(baseCfs.metadata, key, Rows.EMPTY_STATIC_ROW, DeletionTime.LIVE, false);
+        UnfilteredRowIterator empty = UnfilteredRowIterators.noRowsIterator(baseCfs.metadata(), key, Rows.EMPTY_STATIC_ROW, DeletionTime.LIVE, false);
 
-        Collection<Mutation> mutations;
         try (ReadExecutionController orderGroup = command.executionController();
              UnfilteredRowIterator data = UnfilteredPartitionIterators.getOnlyElement(command.executeLocally(orderGroup), command))
         {
-            mutations = baseCfs.keyspace.viewManager.forTable(baseCfs.metadata).generateViewUpdates(Collections.singleton(view), data, empty, nowInSec);
-        }
+            Iterator<Collection<Mutation>> mutations = baseCfs.keyspace.viewManager
+                                                      .forTable(baseCfs.metadata.id)
+                                                      .generateViewUpdates(Collections.singleton(view), data, empty, nowInSec, true);
 
-        if (!mutations.isEmpty())
-            StorageProxy.mutateMV(key.getKey(), mutations, true, noBase);
+            AtomicLong noBase = new AtomicLong(Long.MAX_VALUE);
+            mutations.forEachRemaining(m -> StorageProxy.mutateMV(key.getKey(), m, true, noBase, System.nanoTime()));
+        }
     }
 
     public void run()
     {
-        logger.trace("Running view builder for {}.{}", baseCfs.metadata.ksName, view.name);
+        logger.debug("Starting view builder for {}.{}", baseCfs.metadata.keyspace, view.name);
         UUID localHostId = SystemKeyspace.getLocalHostId();
-        String ksname = baseCfs.metadata.ksName, viewName = view.name;
+        String ksname = baseCfs.metadata.keyspace, viewName = view.name;
 
         if (SystemKeyspace.isViewBuilt(ksname, viewName))
         {
+            logger.debug("View already marked built for {}.{}", baseCfs.metadata.keyspace, view.name);
             if (!SystemKeyspace.isViewStatusReplicated(ksname, viewName))
                 updateDistributed(ksname, viewName, localHostId);
             return;
         }
 
-        Iterable<Range<Token>> ranges = StorageService.instance.getLocalRanges(baseCfs.metadata.ksName);
+        Iterable<Range<Token>> ranges = StorageService.instance.getLocalRanges(baseCfs.metadata.keyspace);
         final Pair<Integer, Token> buildStatus = SystemKeyspace.getViewBuildStatus(ksname, viewName);
         Token lastToken;
         Function<org.apache.cassandra.db.lifecycle.View, Iterable<SSTableReader>> function;
         if (buildStatus == null)
         {
-            baseCfs.forceBlockingFlush();
-            function = org.apache.cassandra.db.lifecycle.View.select(SSTableSet.CANONICAL);
-            int generation = Integer.MIN_VALUE;
-
-            try (Refs<SSTableReader> temp = baseCfs.selectAndReference(function).refs)
-            {
-                for (SSTableReader reader : temp)
-                {
-                    generation = Math.max(reader.descriptor.generation, generation);
-                }
-            }
-
-            SystemKeyspace.beginViewBuild(ksname, viewName, generation);
+            logger.debug("Starting new view build. flushing base table {}.{}", baseCfs.metadata.keyspace, baseCfs.name);
             lastToken = null;
+
+            //We don't track the generation number anymore since if a rebuild is stopped and
+            //restarted the max generation filter may yield no sstables due to compactions.
+            //We only care about max generation *during* a build, not across builds.
+            //see CASSANDRA-13405
+            SystemKeyspace.beginViewBuild(ksname, viewName, 0);
         }
         else
         {
-            function = new Function<org.apache.cassandra.db.lifecycle.View, Iterable<SSTableReader>>()
-            {
-                @Nullable
-                public Iterable<SSTableReader> apply(org.apache.cassandra.db.lifecycle.View view)
-                {
-                    Iterable<SSTableReader> readers = org.apache.cassandra.db.lifecycle.View.select(SSTableSet.CANONICAL).apply(view);
-                    if (readers != null)
-                        return Iterables.filter(readers, ssTableReader -> ssTableReader.descriptor.generation <= buildStatus.left);
-                    return null;
-                }
-            };
             lastToken = buildStatus.right;
+            logger.debug("Resuming view build from token {}. flushing base table {}.{}", lastToken, baseCfs.metadata.keyspace, baseCfs.name);
         }
 
+        baseCfs.forceBlockingFlush();
+        function = org.apache.cassandra.db.lifecycle.View.selectFunction(SSTableSet.CANONICAL);
+
         prevToken = lastToken;
+        long keysBuilt = 0;
         try (Refs<SSTableReader> sstables = baseCfs.selectAndReference(function).refs;
              ReducingKeyIterator iter = new ReducingKeyIterator(sstables))
         {
@@ -161,6 +154,7 @@ public class ViewBuilder extends CompactionInfo.Holder
                         if (range.contains(token))
                         {
                             buildKey(key);
+                            ++keysBuilt;
 
                             if (prevToken == null || prevToken.compareTo(token) != 0)
                             {
@@ -169,14 +163,20 @@ public class ViewBuilder extends CompactionInfo.Holder
                             }
                         }
                     }
+
                     lastToken = null;
                 }
             }
 
             if (!isStopped)
             {
+                logger.debug("Marking view({}.{}) as built covered {} keys ", ksname, viewName, keysBuilt);
                 SystemKeyspace.finishViewBuildStatus(ksname, viewName);
                 updateDistributed(ksname, viewName, localHostId);
+            }
+            else
+            {
+                logger.debug("Stopped build for view({}.{}) after covering {} keys", ksname, viewName, keysBuilt);
             }
         }
         catch (Exception e)
@@ -223,7 +223,8 @@ public class ViewBuilder extends CompactionInfo.Holder
             if (lastToken == null || range.contains(lastToken))
                 rangesLeft = 0;
         }
-        return new CompactionInfo(baseCfs.metadata, OperationType.VIEW_BUILD, rangesLeft, rangesTotal, "ranges", compactionId);
+
+        return new CompactionInfo(baseCfs.metadata(), OperationType.VIEW_BUILD, rangesLeft, rangesTotal, "ranges", compactionId);
     }
 
     public void stop()

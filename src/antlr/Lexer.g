@@ -56,6 +56,8 @@ lexer grammar Lexer;
 }
 
 // Case-insensitive keywords
+// When adding a new reserved keyword, add entry to o.a.c.cql3.ReservedKeywords as well
+// When adding a new unreserved keyword, add entry to unreserved keywords in Parser.g
 K_SELECT:      S E L E C T;
 K_FROM:        F R O M;
 K_AS:          A S;
@@ -117,6 +119,7 @@ K_FILTERING:   F I L T E R I N G;
 K_IF:          I F;
 K_IS:          I S;
 K_CONTAINS:    C O N T A I N S;
+K_GROUP:       G R O U P;
 
 K_GRANT:       G R A N T;
 K_ALL:         A L L;
@@ -151,6 +154,7 @@ K_BOOLEAN:     B O O L E A N;
 K_COUNTER:     C O U N T E R;
 K_DECIMAL:     D E C I M A L;
 K_DOUBLE:      D O U B L E;
+K_DURATION:    D U R A T I O N;
 K_FLOAT:       F L O A T;
 K_INET:        I N E T;
 K_INT:         I N T;
@@ -172,8 +176,10 @@ K_EXISTS:      E X I S T S;
 
 K_MAP:         M A P;
 K_LIST:        L I S T;
-K_NAN:         N A N;
-K_INFINITY:    I N F I N I T Y;
+K_POSITIVE_NAN: N A N;
+K_NEGATIVE_NAN: '-' N A N;
+K_POSITIVE_INFINITY:    I N F I N I T Y;
+K_NEGATIVE_INFINITY: '-' I N F I N I T Y;
 K_TUPLE:       T U P L E;
 
 K_TRIGGER:     T R I G G E R;
@@ -195,6 +201,8 @@ K_OR:          O R;
 K_REPLACE:     R E P L A C E;
 
 K_JSON:        J S O N;
+K_DEFAULT:     D E F A U L T;
+K_UNSET:       U N S E T;
 K_LIKE:        L I K E;
 
 // Case-insensitive alpha characters
@@ -270,6 +278,20 @@ fragment EXPONENT
     : E ('+' | '-')? DIGIT+
     ;
 
+fragment DURATION_UNIT
+    : Y
+    | M O
+    | W
+    | D
+    | H
+    | M
+    | S
+    | M S
+    | U S
+    | '\u00B5' S
+    | N S
+    ;
+
 INTEGER
     : '-'? DIGIT+
     ;
@@ -278,13 +300,18 @@ QMARK
     : '?'
     ;
 
+RANGE
+    : '..'
+    ;
+
 /*
  * Normally a lexer only emits one token at a time, but ours is tricked out
  * to support multiple (see @lexer::members near the top of the grammar).
  */
 FLOAT
-    : INTEGER EXPONENT
-    | INTEGER '.' DIGIT* EXPONENT?
+    : (INTEGER '.' RANGE) => INTEGER '.'
+    | (INTEGER RANGE) => INTEGER {$type = INTEGER;}
+    | INTEGER ('.' DIGIT*)? EXPONENT?
     ;
 
 /*
@@ -292,6 +319,13 @@ FLOAT
  */
 BOOLEAN
     : T R U E | F A L S E
+    ;
+
+DURATION
+    : '-'? DIGIT+ DURATION_UNIT (DIGIT+ DURATION_UNIT)*
+    | '-'? 'P' (DIGIT+ 'Y')? (DIGIT+ 'M')? (DIGIT+ 'D')? ('T' (DIGIT+ 'H')? (DIGIT+ 'M')? (DIGIT+ 'S')?)? // ISO 8601 "format with designators"
+    | '-'? 'P' DIGIT+ 'W'
+    | '-'? 'P' DIGIT DIGIT DIGIT DIGIT '-' DIGIT DIGIT '-' DIGIT DIGIT 'T' DIGIT DIGIT ':' DIGIT DIGIT ':' DIGIT DIGIT // ISO 8601 "alternative format"
     ;
 
 IDENT

@@ -22,11 +22,9 @@ import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Proxy;
+import java.net.Inet6Address;
 import java.net.InetAddress;
-import java.rmi.NoSuchObjectException;
-import java.rmi.Remote;
-import java.rmi.RemoteException;
-import java.rmi.registry.LocateRegistry;
+import java.rmi.*;
 import java.rmi.server.RMIClientSocketFactory;
 import java.rmi.server.RMIServerSocketFactory;
 import java.rmi.server.UnicastRemoteObject;
@@ -36,7 +34,6 @@ import java.util.Map;
 import java.util.stream.Collectors;
 import javax.management.remote.*;
 import javax.management.remote.rmi.RMIConnectorServer;
-import javax.management.remote.rmi.RMIJRMPServerImpl;
 import javax.rmi.ssl.SslRMIClientSocketFactory;
 import javax.rmi.ssl.SslRMIServerSocketFactory;
 import javax.security.auth.Subject;
@@ -49,12 +46,14 @@ import org.slf4j.LoggerFactory;
 import com.sun.jmx.remote.internal.RMIExporter;
 import com.sun.jmx.remote.security.JMXPluggableAuthenticator;
 import org.apache.cassandra.auth.jmx.AuthenticationProxy;
+import sun.rmi.registry.RegistryImpl;
 import sun.rmi.server.UnicastServerRef2;
 
 public class JMXServerUtils
 {
     private static final Logger logger = LoggerFactory.getLogger(JMXServerUtils.class);
 
+    private static java.rmi.registry.Registry registry;
 
     /**
      * Creates a server programmatically. This allows us to set parameters which normally are
@@ -65,35 +64,16 @@ public class JMXServerUtils
     {
         Map<String, Object> env = new HashMap<>();
 
-        String urlTemplate = "service:jmx:rmi://%1$s/jndi/rmi://%1$s:%2$d/jmxrmi";
-        String url;
-        String host;
-        InetAddress serverAddress;
+        InetAddress serverAddress = null;
         if (local)
         {
             serverAddress = InetAddress.getLoopbackAddress();
-            host = serverAddress.getHostAddress();
-            System.setProperty("java.rmi.server.hostname", host);
-        }
-        else
-        {
-            // if the java.rmi.server.hostname property is set, we'll take its value
-            // and use that when creating the RMIServerSocket to which we bind the RMI
-            // registry. This allows us to effectively restrict to a single interface
-            // if required. See http://bugs.java.com/bugdatabase/view_bug.do?bug_id=4880793
-            // for more detail. If the hostname property is not set, the registry will
-            // be bound to the wildcard address
-            host = System.getProperty("java.rmi.server.hostname");
-            serverAddress = host == null ? null : InetAddress.getByName(host);
+            System.setProperty("java.rmi.server.hostname", serverAddress.getHostAddress());
         }
 
         // Configure the RMI client & server socket factories, including SSL config.
-        env.putAll(configureJmxSocketFactories(serverAddress));
+        env.putAll(configureJmxSocketFactories(serverAddress, local));
 
-        url = String.format(urlTemplate, (host == null ? "0.0.0.0" : serverAddress.getHostAddress()), port);
-        LocateRegistry.createRegistry(port,
-                                     (RMIClientSocketFactory) env.get(RMIConnectorServer.RMI_CLIENT_SOCKET_FACTORY_ATTRIBUTE),
-                                     (RMIServerSocketFactory) env.get(RMIConnectorServer.RMI_SERVER_SOCKET_FACTORY_ATTRIBUTE));
 
         // Configure authn, using a JMXAuthenticator which either wraps a set log LoginModules configured
         // via a JAAS configuration entry, or one which delegates to the standard file based authenticator.
@@ -110,8 +90,10 @@ public class JMXServerUtils
         // sun.rmi.dgc.server.gcInterval millis (default is 3600000ms/1 hour)
         env.put(RMIExporter.EXPORTER_ATTRIBUTE, new Exporter());
 
+
+        int rmiPort = Integer.getInteger("com.sun.management.jmxremote.rmi.port", 0);
         JMXConnectorServer jmxServer =
-            JMXConnectorServerFactory.newJMXConnectorServer(new JMXServiceURL(url),
+            JMXConnectorServerFactory.newJMXConnectorServer(new JMXServiceURL("rmi", null, rmiPort),
                                                             env,
                                                             ManagementFactory.getPlatformMBeanServer());
 
@@ -119,8 +101,31 @@ public class JMXServerUtils
         if (authzProxy != null)
             jmxServer.setMBeanServerForwarder(authzProxy);
 
-        logger.info("Configured JMX server at: {}", url);
+        jmxServer.start();
+
+        // use a custom Registry to avoid having to interact with it internally using the remoting interface
+        configureRMIRegistry(port, env);
+
+        logJmxServiceUrl(serverAddress, port);
         return jmxServer;
+    }
+
+    private static void configureRMIRegistry(int port, Map<String, Object> env) throws RemoteException
+    {
+        Exporter exporter = (Exporter)env.get(RMIExporter.EXPORTER_ATTRIBUTE);
+        // If ssl is enabled, make sure it's also in place for the RMI registry
+        // by using the SSL socket factories already created and stashed in env
+        if (Boolean.getBoolean("com.sun.management.jmxremote.ssl"))
+        {
+            registry = new Registry(port,
+                                   (RMIClientSocketFactory)env.get(RMIConnectorServer.RMI_CLIENT_SOCKET_FACTORY_ATTRIBUTE),
+                                   (RMIServerSocketFactory)env.get(RMIConnectorServer.RMI_SERVER_SOCKET_FACTORY_ATTRIBUTE),
+                                   exporter.connectorServer);
+        }
+        else
+        {
+            registry = new Registry(port, exporter.connectorServer);
+        }
     }
 
     private static Map<String, Object> configureJmxAuthentication()
@@ -187,7 +192,7 @@ public class JMXServerUtils
         }
     }
 
-    private static Map<String, Object> configureJmxSocketFactories(InetAddress serverAddress)
+    private static Map<String, Object> configureJmxSocketFactories(InetAddress serverAddress, boolean localOnly)
     {
         Map<String, Object> env = new HashMap<>();
         if (Boolean.getBoolean("com.sun.management.jmxremote.ssl"))
@@ -216,13 +221,32 @@ public class JMXServerUtils
             env.put("com.sun.jndi.rmi.factory.socket", clientFactory);
             logJmxSslConfig(serverFactory);
         }
-        else
+        else if (localOnly)
         {
             env.put(RMIConnectorServer.RMI_SERVER_SOCKET_FACTORY_ATTRIBUTE,
                     new RMIServerSocketFactoryImpl(serverAddress));
         }
 
         return env;
+    }
+
+    private static void logJmxServiceUrl(InetAddress serverAddress, int port)
+    {
+        String urlTemplate = "service:jmx:rmi://%1$s/jndi/rmi://%1$s:%2$d/jmxrmi";
+        String hostName;
+        if (serverAddress == null)
+        {
+            hostName = FBUtilities.getBroadcastAddress() instanceof Inet6Address ? "[::]" : "0.0.0.0";
+        }
+        else
+        {
+            // hostnames based on IPv6 addresses must be wrapped in [ ]
+            hostName = serverAddress instanceof Inet6Address
+                       ? '[' + serverAddress.getHostAddress() + ']'
+                       : serverAddress.getHostAddress();
+        }
+        String url = String.format(urlTemplate, hostName, port);
+        logger.info("Configured JMX server at: {}", url);
     }
 
     private static void logJmxSslConfig(SslRMIServerSocketFactory serverFactory)
@@ -279,21 +303,87 @@ public class JMXServerUtils
      */
     private static class Exporter implements RMIExporter
     {
+        // the first object to be exported by this instance is *always* the JMXConnectorServer
+        // instance created by createJMXServer. Keep a handle to it, as it needs to be supplied
+        // to our custom Registry too.
+        private Remote connectorServer;
+
         public Remote exportObject(Remote obj, int port, RMIClientSocketFactory csf, RMIServerSocketFactory ssf)
         throws RemoteException
         {
-            // We should only ever get here by configuring our own JMX Connector server,
-            // so assert some invariants we expect to be true in that case
-            assert ssf != null; // we always configure a custom server socket factory
+            Remote remote = new UnicastServerRef2(port, csf, ssf).exportObject(obj, null, true);
+            // Keep a reference to the first object exported, the JMXConnectorServer
+            if (connectorServer == null)
+                connectorServer = remote;
 
-            // as we always configure a custom server socket factory, either for SSL or to ensure
-            // only loopback addresses, we use a UnicastServerRef2 for exporting
-            return new UnicastServerRef2(port, csf, ssf).exportObject(obj, null, true);
+            return remote;
         }
 
         public boolean unexportObject(Remote obj, boolean force) throws NoSuchObjectException
         {
             return UnicastRemoteObject.unexportObject(obj, force);
+        }
+    }
+
+    /**
+     * Using this class avoids the necessity to interact with the registry via its
+     * remoting interface. This is necessary because when SSL is enabled for the registry,
+     * that remote interaction is treated just the same as one from an external client.
+     * That is problematic when binding the JMXConnectorServer to the Registry as it requires
+     * the client, which in this case is our own internal code, to connect like any other SSL
+     * client, meaning we need a truststore containing our own certificate.
+     * This bypasses the binding API completely, which emulates the behaviour of
+     * ConnectorBootstrap when the subsystem is initialized by the JVM Agent directly.
+     *
+     * See CASSANDRA-12109.
+     */
+    private static class Registry extends RegistryImpl
+    {
+        private final static String KEY = "jmxrmi";
+        private final Remote connectorServer;
+
+        private Registry(int port, Remote connectorServer) throws RemoteException
+        {
+            super(port);
+            this.connectorServer = connectorServer;
+        }
+
+        private Registry(int port,
+                         RMIClientSocketFactory csf,
+                         RMIServerSocketFactory ssf,
+                         Remote connectorServer) throws RemoteException
+        {
+            super(port, csf, ssf);
+            this.connectorServer = connectorServer;
+        }
+
+        public Remote lookup(String name) throws RemoteException, NotBoundException
+        {
+            if (name.equals(KEY))
+                return connectorServer;
+
+            throw new NotBoundException(String.format("Only the JMX Connector Server named %s " +
+                                                      "is bound in this registry", KEY));
+        }
+
+        public void bind(String name, Remote obj) throws RemoteException, AlreadyBoundException
+        {
+            throw new UnsupportedOperationException("Unsupported");
+        }
+
+        public void unbind(String name) throws RemoteException, NotBoundException
+        {
+            throw new UnsupportedOperationException("Unsupported");
+        }
+
+        public void rebind(String name, Remote obj) throws RemoteException
+        {
+            throw new UnsupportedOperationException("Unsupported");
+        }
+
+        public String[] list() throws RemoteException
+        {
+            return new String[] {KEY};
         }
     }
 }

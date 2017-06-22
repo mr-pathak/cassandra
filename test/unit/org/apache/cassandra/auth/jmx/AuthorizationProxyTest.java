@@ -25,14 +25,15 @@ import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import javax.management.MalformedObjectNameException;
 import javax.management.ObjectName;
-import javax.management.remote.JMXPrincipal;
 import javax.security.auth.Subject;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.auth.*;
+import org.apache.cassandra.config.DatabaseDescriptor;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -41,6 +42,12 @@ import static org.junit.Assert.fail;
 
 public class AuthorizationProxyTest
 {
+    @BeforeClass
+    public static void setup() throws Exception
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
+
     JMXResource osBean = JMXResource.mbean("java.lang:type=OperatingSystem");
     JMXResource runtimeBean = JMXResource.mbean("java.lang:type=Runtime");
     JMXResource threadingBean = JMXResource.mbean("java.lang:type=Threading");

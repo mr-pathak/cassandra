@@ -50,17 +50,17 @@ public abstract class ParsedStatement
     {
         /**
          * Contains the CQL statement source if the statement has been "regularly" perpared via
-         * {@link org.apache.cassandra.cql3.QueryProcessor#prepare(java.lang.String, org.apache.cassandra.service.ClientState, boolean)} /
-         * {@link QueryHandler#prepare(java.lang.String, org.apache.cassandra.service.QueryState, java.util.Map)}.
+         * {@link org.apache.cassandra.cql3.QueryProcessor#prepare(java.lang.String, org.apache.cassandra.service.ClientState)} /
+         * {@link QueryHandler#prepare(java.lang.String, org.apache.cassandra.service.ClientState, java.util.Map)}.
          * Other usages of this class may or may not contain the CQL statement source.
          */
         public String rawCQLStatement;
 
         public final CQLStatement statement;
         public final List<ColumnSpecification> boundNames;
-        public final Short[] partitionKeyBindIndexes;
+        public final short[] partitionKeyBindIndexes;
 
-        protected Prepared(CQLStatement statement, List<ColumnSpecification> boundNames, Short[] partitionKeyBindIndexes)
+        protected Prepared(CQLStatement statement, List<ColumnSpecification> boundNames, short[] partitionKeyBindIndexes)
         {
             this.statement = statement;
             this.boundNames = boundNames;
@@ -68,7 +68,7 @@ public abstract class ParsedStatement
             this.rawCQLStatement = "";
         }
 
-        public Prepared(CQLStatement statement, VariableSpecifications names, Short[] partitionKeyBindIndexes)
+        public Prepared(CQLStatement statement, VariableSpecifications names, short[] partitionKeyBindIndexes)
         {
             this(statement, names.getSpecifications(), partitionKeyBindIndexes);
         }

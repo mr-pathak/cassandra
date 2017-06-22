@@ -25,23 +25,27 @@ import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.FileDataInput;
-import org.apache.cassandra.io.util.SegmentedFile;
+import org.apache.cassandra.io.util.FileHandle;
 
 /**
  *  A Cell Iterator over SSTable
  */
 public class SSTableIterator extends AbstractSSTableIterator
 {
+    /**
+     * The index of the slice being processed.
+     */
+    private int slice;
+
     public SSTableIterator(SSTableReader sstable,
                            FileDataInput file,
                            DecoratedKey key,
                            RowIndexEntry indexEntry,
                            Slices slices,
                            ColumnFilter columns,
-                           boolean isForThrift,
-                           SegmentedFile ifile)
+                           FileHandle ifile)
     {
-        super(sstable, file, key, indexEntry, slices, columns, isForThrift, ifile);
+        super(sstable, file, key, indexEntry, slices, columns, ifile);
     }
 
     protected Reader createReaderInternal(RowIndexEntry indexEntry, FileDataInput file, boolean shouldCloseFile)
@@ -49,6 +53,18 @@ public class SSTableIterator extends AbstractSSTableIterator
         return indexEntry.isIndexed()
              ? new ForwardIndexedReader(indexEntry, file, shouldCloseFile)
              : new ForwardReader(file, shouldCloseFile);
+    }
+
+    protected int nextSliceIndex()
+    {
+        int next = slice;
+        slice++;
+        return next;
+    }
+
+    protected boolean hasMoreSlices()
+    {
+        return slice < slices.size();
     }
 
     public boolean isReverseOrder()
@@ -121,13 +137,27 @@ public class SSTableIterator extends AbstractSSTableIterator
         {
             assert deserializer != null;
 
-            if (!deserializer.hasNext() || deserializer.compareNextTo(end) > 0)
-                return null;
+            while (true)
+            {
+                // We use a same reasoning as in handlePreSliceData regarding the strictness of the inequality below.
+                // We want to exclude deserialized unfiltered equal to end, because 1) we won't miss any rows since those
+                // woudn't be equal to a slice bound and 2) a end bound can be equal to a start bound
+                // (EXCL_END(x) == INCL_START(x) for instance) and in that case we don't want to return start bound because
+                // it's fundamentally excluded. And if the bound is a  end (for a range tombstone), it means it's exactly
+                // our slice end, but in that  case we will properly close the range tombstone anyway as part of our "close
+                // an open marker" code in hasNextInterna
+                if (!deserializer.hasNext() || deserializer.compareNextTo(end) >= 0)
+                    return null;
 
-            Unfiltered next = deserializer.readNext();
-            if (next.kind() == Unfiltered.Kind.RANGE_TOMBSTONE_MARKER)
-                updateOpenMarker((RangeTombstoneMarker)next);
-            return next;
+                Unfiltered next = deserializer.readNext();
+                // We may get empty row for the same reason expressed on UnfilteredSerializer.deserializeOne.
+                if (next.isEmpty())
+                    continue;
+
+                if (next.kind() == Unfiltered.Kind.RANGE_TOMBSTONE_MARKER)
+                    updateOpenMarker((RangeTombstoneMarker) next);
+                return next;
+            }
         }
 
         protected boolean hasNextInternal() throws IOException
@@ -183,7 +213,7 @@ public class SSTableIterator extends AbstractSSTableIterator
         private ForwardIndexedReader(RowIndexEntry indexEntry, FileDataInput file, boolean shouldCloseFile)
         {
             super(file, shouldCloseFile);
-            this.indexState = new IndexState(this, sstable.metadata.comparator, indexEntry, false, ifile);
+            this.indexState = new IndexState(this, metadata.comparator, indexEntry, false, ifile);
             this.lastBlockIdx = indexState.blocksCount(); // if we never call setForSlice, that's where we want to stop
         }
 
@@ -240,12 +270,10 @@ public class SSTableIterator extends AbstractSSTableIterator
             // so if currentIdx == lastBlockIdx and slice.end < indexes[currentIdx].firstName, we're guaranteed that the
             // whole slice is between the previous block end and this block start, and thus has no corresponding
             // data. One exception is if the previous block ends with an openMarker as it will cover our slice
-            // and we need to return it (we also don't skip the slice for the old format because we didn't have the openMarker
-            // info in that case and can't rely on this optimization).
+            // and we need to return it.
             if (indexState.currentBlockIdx() == lastBlockIdx
                 && metadata().comparator.compare(slice.end(), indexState.currentIndex().firstName) < 0
-                && openMarker == null
-                && sstable.descriptor.version.storeRows())
+                && openMarker == null)
             {
                 sliceDone = true;
             }
@@ -254,24 +282,31 @@ public class SSTableIterator extends AbstractSSTableIterator
         @Override
         protected Unfiltered computeNext() throws IOException
         {
-            // Our previous read might have made us cross an index block boundary. If so, update our informations.
-            // If we read from the beginning of the partition, this is also what will initialize the index state.
-            indexState.updateBlock();
+            while (true)
+            {
+                // Our previous read might have made us cross an index block boundary. If so, update our informations.
+                // If we read from the beginning of the partition, this is also what will initialize the index state.
+                indexState.updateBlock();
 
-            // Return the next unfiltered unless we've reached the end, or we're beyond our slice
-            // end (note that unless we're on the last block for the slice, there is no point
-            // in checking the slice end).
-            if (indexState.isDone()
-                || indexState.currentBlockIdx() > lastBlockIdx
-                || !deserializer.hasNext()
-                || (indexState.currentBlockIdx() == lastBlockIdx && deserializer.compareNextTo(end) > 0))
-                return null;
+                // Return the next unfiltered unless we've reached the end, or we're beyond our slice
+                // end (note that unless we're on the last block for the slice, there is no point
+                // in checking the slice end).
+                if (indexState.isDone()
+                    || indexState.currentBlockIdx() > lastBlockIdx
+                    || !deserializer.hasNext()
+                    || (indexState.currentBlockIdx() == lastBlockIdx && deserializer.compareNextTo(end) >= 0))
+                    return null;
 
 
-            Unfiltered next = deserializer.readNext();
-            if (next.kind() == Unfiltered.Kind.RANGE_TOMBSTONE_MARKER)
-                updateOpenMarker((RangeTombstoneMarker)next);
-            return next;
+                Unfiltered next = deserializer.readNext();
+                // We may get empty row for the same reason expressed on UnfilteredSerializer.deserializeOne.
+                if (next.isEmpty())
+                    continue;
+
+                if (next.kind() == Unfiltered.Kind.RANGE_TOMBSTONE_MARKER)
+                    updateOpenMarker((RangeTombstoneMarker) next);
+                return next;
+            }
         }
     }
 }

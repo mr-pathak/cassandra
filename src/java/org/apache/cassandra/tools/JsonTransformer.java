@@ -1,3 +1,23 @@
+/*
+ *
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ *
+ */
 package org.apache.cassandra.tools;
 
 import java.io.IOException;
@@ -10,8 +30,9 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.ColumnDefinition;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.CollectionType;
@@ -26,14 +47,14 @@ import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.io.sstable.ISSTableScanner;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.codehaus.jackson.JsonFactory;
 import org.codehaus.jackson.JsonGenerator;
 import org.codehaus.jackson.impl.Indenter;
-import org.codehaus.jackson.util.DefaultPrettyPrinter;
 import org.codehaus.jackson.util.DefaultPrettyPrinter.NopIndenter;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.codehaus.jackson.util.DefaultPrettyPrinter;
 
 public final class JsonTransformer
 {
@@ -48,7 +69,7 @@ public final class JsonTransformer
 
     private final CompactIndenter arrayIndenter = new CompactIndenter();
 
-    private final CFMetaData metadata;
+    private final TableMetadata metadata;
 
     private final ISSTableScanner currentScanner;
 
@@ -56,7 +77,7 @@ public final class JsonTransformer
 
     private long currentPosition = 0;
 
-    private JsonTransformer(JsonGenerator json, ISSTableScanner currentScanner, boolean rawTime, CFMetaData metadata)
+    private JsonTransformer(JsonGenerator json, ISSTableScanner currentScanner, boolean rawTime, TableMetadata metadata)
     {
         this.json = json;
         this.metadata = metadata;
@@ -69,7 +90,7 @@ public final class JsonTransformer
         json.setPrettyPrinter(prettyPrinter);
     }
 
-    public static void toJson(ISSTableScanner currentScanner, Stream<UnfilteredRowIterator> partitions, boolean rawTime, CFMetaData metadata, OutputStream out)
+    public static void toJson(ISSTableScanner currentScanner, Stream<UnfilteredRowIterator> partitions, boolean rawTime, TableMetadata metadata, OutputStream out)
             throws IOException
     {
         try (JsonGenerator json = jsonFactory.createJsonGenerator(new OutputStreamWriter(out, StandardCharsets.UTF_8)))
@@ -81,7 +102,7 @@ public final class JsonTransformer
         }
     }
 
-    public static void keysToJson(ISSTableScanner currentScanner, Stream<DecoratedKey> keys, boolean rawTime, CFMetaData metadata, OutputStream out) throws IOException
+    public static void keysToJson(ISSTableScanner currentScanner, Stream<DecoratedKey> keys, boolean rawTime, TableMetadata metadata, OutputStream out) throws IOException
     {
         try (JsonGenerator json = jsonFactory.createJsonGenerator(new OutputStreamWriter(out, StandardCharsets.UTF_8)))
         {
@@ -99,7 +120,7 @@ public final class JsonTransformer
 
     private void serializePartitionKey(DecoratedKey key)
     {
-        AbstractType<?> keyValidator = metadata.getKeyValidator();
+        AbstractType<?> keyValidator = metadata.partitionKeyType;
         objectIndenter.setCompact(true);
         try
         {
@@ -156,7 +177,6 @@ public final class JsonTransformer
 
     private void serializePartition(UnfilteredRowIterator partition)
     {
-        String key = metadata.getKeyValidator().getString(partition.partitionKey().getKey());
         try
         {
             json.writeStartObject();
@@ -168,19 +188,18 @@ public final class JsonTransformer
             json.writeNumberField("position", this.currentScanner.getCurrentPosition());
 
             if (!partition.partitionLevelDeletion().isLive())
-            {
                 serializeDeletion(partition.partitionLevelDeletion());
-            }
-            else
+
+            json.writeEndObject();
+
+            if (partition.hasNext() || partition.staticRow() != null)
             {
-                json.writeEndObject();
                 json.writeFieldName("rows");
                 json.writeStartArray();
                 updatePosition();
                 if (!partition.staticRow().isEmpty())
-                {
                     serializeRow(partition.staticRow());
-                }
+
                 Unfiltered unfiltered;
                 updatePosition();
                 while (partition.hasNext())
@@ -197,12 +216,13 @@ public final class JsonTransformer
                     updatePosition();
                 }
                 json.writeEndArray();
-            }
 
-            json.writeEndObject();
+                json.writeEndObject();
+            }
         }
         catch (IOException e)
         {
+            String key = metadata.partitionKeyType.getString(partition.partitionKey().getKey());
             logger.error("Fatal error parsing partition: {}", key, e);
         }
     }
@@ -313,10 +333,10 @@ public final class JsonTransformer
             objectIndenter.setCompact(true);
             json.writeStartArray();
             arrayIndenter.setCompact(true);
-            List<ColumnDefinition> clusteringColumns = metadata.clusteringColumns();
+            List<ColumnMetadata> clusteringColumns = metadata.clusteringColumns();
             for (int i = 0; i < clusteringColumns.size(); i++)
             {
-                ColumnDefinition column = clusteringColumns.get(i);
+                ColumnMetadata column = clusteringColumns.get(i);
                 if (i >= clustering.size())
                 {
                     json.writeString("*");
@@ -441,9 +461,14 @@ public final class JsonTransformer
 
     private String dateString(TimeUnit from, long time)
     {
+        if (rawTime)
+        {
+            return Long.toString(time);
+        }
+        
         long secs = from.toSeconds(time);
         long offset = Math.floorMod(from.toNanos(time), 1000_000_000L); // nanos per sec
-        return rawTime? Long.toString(time) : Instant.ofEpochSecond(secs, offset).toString();
+        return Instant.ofEpochSecond(secs, offset).toString();
     }
 
     /**

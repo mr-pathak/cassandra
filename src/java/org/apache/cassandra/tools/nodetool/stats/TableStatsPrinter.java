@@ -15,50 +15,35 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.cassandra.tools.nodetool.stats;
 
 import java.io.PrintStream;
 import java.util.List;
 
-import org.json.simple.JSONObject;
-import org.yaml.snakeyaml.Yaml;
-
-public enum TableStatsPrinter
+public class TableStatsPrinter
 {
-    DEFAULT(new DefaultPrinter()),
-    JSON(new JsonPrinter()),
-    YAML(new YamlPrinter()),;
-
-    private final StatsPrinter<StatsHolder> printer;
-
-    TableStatsPrinter(StatsPrinter<StatsHolder> printer)
-    {
-        this.printer = printer;
-    }
-
-    public void print(StatsHolder stats, PrintStream out)
-    {
-        printer.printFormat(stats, out);
-    }
-
-    public static TableStatsPrinter from(String format)
+    public static StatsPrinter from(String format)
     {
         switch (format)
         {
             case "json":
-                return JSON;
+                return new StatsPrinter.JsonPrinter();
             case "yaml":
-                return YAML;
+                return new StatsPrinter.YamlPrinter();
             default:
-                return DEFAULT;
+                return new DefaultPrinter();
         }
     }
 
-    private static class DefaultPrinter implements StatsPrinter<StatsHolder>
+    private static class DefaultPrinter implements StatsPrinter<TableStatsHolder>
     {
         @Override
-        public void printFormat(StatsHolder data, PrintStream out)
+        public void print(TableStatsHolder data, PrintStream out)
         {
+            out.println("Total number of tables: " + data.numberOfTables);
+            out.println("----------------");
+
             List<StatsKeyspace> keyspaces = data.keyspaces;
             for (StatsKeyspace keyspace : keyspaces)
             {
@@ -75,6 +60,7 @@ public enum TableStatsPrinter
                 for (StatsTable table : tables)
                 {
                     out.println("\t\tTable" + (table.isIndex ? " (index): " + table.name : ": ") + table.name);
+                    out.println("\t\tSSTable count: " + table.sstableCount);
                     if (table.isLeveledSstable)
                         out.println("\t\tSSTables in each level: [" + String.join(", ",
                                                                                   table.sstablesInEachLevel) + "]");
@@ -98,6 +84,7 @@ public enum TableStatsPrinter
                     out.println("\t\tLocal write count: " + table.localWriteCount);
                     out.printf("\t\tLocal write latency: %01.3f ms%n", table.localWriteLatencyMs);
                     out.println("\t\tPending flushes: " + table.pendingFlushes);
+                    out.println("\t\tPercent repaired: " + table.percentRepaired);
 
                     out.println("\t\tBloom filter false positives: " + table.bloomFilterFalsePositives);
                     out.printf("\t\tBloom filter false ratio: %01.5f%n", table.bloomFilterFalseRatio);
@@ -124,26 +111,4 @@ public enum TableStatsPrinter
             }
         }
     }
-
-    private static class JsonPrinter implements StatsPrinter<StatsHolder>
-    {
-        @Override
-        public void printFormat(StatsHolder data, PrintStream out)
-        {
-            JSONObject json = new JSONObject();
-            json.putAll(data.convert2Map());
-            out.println(json.toString());
-        }
-    }
-
-    private static class YamlPrinter implements StatsPrinter<StatsHolder>
-    {
-        @Override
-        public void printFormat(StatsHolder data, PrintStream out)
-        {
-            Yaml yaml = new Yaml();
-            out.println(yaml.dump(data.convert2Map()));
-        }
-    }
-
 }

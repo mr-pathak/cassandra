@@ -23,6 +23,7 @@ import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.BufferDecoratedKey;
 import org.apache.cassandra.db.DecoratedKey;
@@ -36,6 +37,7 @@ import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.LongType;
 import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.utils.MurmurHash;
 import org.apache.cassandra.utils.Pair;
 
@@ -47,10 +49,18 @@ import com.google.common.collect.Iterators;
 import com.google.common.collect.Sets;
 
 import junit.framework.Assert;
+
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 public class OnDiskIndexTest
 {
+    @BeforeClass
+    public static void setupDD()
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
+
     @Test
     public void testStringSAConstruction() throws Exception
     {
@@ -699,6 +709,41 @@ public class OnDiskIndexTest
 
         a.close();
         b.close();
+    }
+
+    @Test
+    public void testPrefixSearchWithCONTAINSMode() throws Exception
+    {
+        Map<ByteBuffer, TokenTreeBuilder> data = new HashMap<ByteBuffer, TokenTreeBuilder>()
+        {{
+
+            put(UTF8Type.instance.decompose("lady gaga"), keyBuilder(1L));
+
+            // Partial term for 'lady of bells'
+            DataOutputBuffer ladyOfBellsBuffer = new DataOutputBuffer();
+            ladyOfBellsBuffer.writeShort(UTF8Type.instance.decompose("lady of bells").remaining() | (1 << OnDiskIndexBuilder.IS_PARTIAL_BIT));
+            ladyOfBellsBuffer.write(UTF8Type.instance.decompose("lady of bells"));
+            put(ladyOfBellsBuffer.asNewBuffer(), keyBuilder(2L));
+
+
+            put(UTF8Type.instance.decompose("lady pank"),  keyBuilder(3L));
+        }};
+
+        OnDiskIndexBuilder builder = new OnDiskIndexBuilder(UTF8Type.instance, UTF8Type.instance, OnDiskIndexBuilder.Mode.CONTAINS);
+        for (Map.Entry<ByteBuffer, TokenTreeBuilder> e : data.entrySet())
+            addAll(builder, e.getKey(), e.getValue());
+
+        File index = File.createTempFile("on-disk-sa-prefix-contains-search", "db");
+        index.deleteOnExit();
+
+        builder.finish(index);
+
+        OnDiskIndex onDisk = new OnDiskIndex(index, UTF8Type.instance, new KeyConverter());
+
+        // check that lady% return lady gaga (1) and lady pank (3) but not lady of bells(2)
+        Assert.assertEquals(convert(1, 3), convert(onDisk.search(expressionFor("lady", Operator.LIKE_PREFIX))));
+
+        onDisk.close();
     }
 
     private void testSearchRangeWithSuperBlocks(OnDiskIndex onDiskIndex, long start, long end)

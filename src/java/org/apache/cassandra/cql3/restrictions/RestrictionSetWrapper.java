@@ -18,8 +18,9 @@
 package org.apache.cassandra.cql3.restrictions;
 
 import java.util.List;
+import java.util.Set;
 
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.db.filter.RowFilter;
@@ -48,7 +49,7 @@ class RestrictionSetWrapper implements Restrictions
         restrictions.addRowFilterTo(filter, indexManager, options);
     }
 
-    public List<ColumnDefinition> getColumnDefs()
+    public List<ColumnMetadata> getColumnDefs()
     {
         return restrictions.getColumnDefs();
     }
@@ -73,12 +74,12 @@ class RestrictionSetWrapper implements Restrictions
         return restrictions.hasSupportingIndex(indexManager);
     }
 
-    public ColumnDefinition getFirstColumn()
+    public ColumnMetadata getFirstColumn()
     {
         return restrictions.getFirstColumn();
     }
 
-    public ColumnDefinition getLastColumn()
+    public ColumnMetadata getLastColumn()
     {
         return restrictions.getLastColumn();
     }
@@ -88,8 +89,23 @@ class RestrictionSetWrapper implements Restrictions
         return restrictions.hasIN();
     }
 
+    public boolean hasContains()
+    {
+        return restrictions.hasContains();
+    }
+
+    public boolean hasSlice()
+    {
+        return restrictions.hasSlice();
+    }
+
     public boolean hasOnlyEqualityRestrictions()
     {
         return restrictions.hasOnlyEqualityRestrictions();
+    }
+
+    public Set<Restriction> getRestrictions(ColumnMetadata columnDef)
+    {
+        return restrictions.getRestrictions(columnDef);
     }
 }

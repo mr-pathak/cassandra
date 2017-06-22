@@ -17,9 +17,7 @@
  */
 package org.apache.cassandra.db.view;
 
-import java.nio.ByteBuffer;
 import java.util.*;
-import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import javax.annotation.Nullable;
@@ -30,17 +28,15 @@ import org.apache.cassandra.cql3.*;
 import org.apache.cassandra.cql3.statements.ParsedStatement;
 import org.apache.cassandra.cql3.statements.SelectStatement;
 import org.apache.cassandra.db.*;
-import org.apache.cassandra.config.*;
-import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.db.compaction.CompactionManager;
-import org.apache.cassandra.db.partitions.*;
 import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.schema.ViewMetadata;
 import org.apache.cassandra.service.ClientState;
-import org.apache.cassandra.service.pager.QueryPager;
-import org.apache.cassandra.transport.Server;
 import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.btree.BTreeSet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -54,11 +50,11 @@ public class View
     private static final Logger logger = LoggerFactory.getLogger(View.class);
 
     public final String name;
-    private volatile ViewDefinition definition;
+    private volatile ViewMetadata definition;
 
     private final ColumnFamilyStore baseCfs;
 
-    public volatile List<ColumnDefinition> baseNonPKColumnsInViewPK;
+    public volatile List<ColumnMetadata> baseNonPKColumnsInViewPK;
 
     private final boolean includeAllColumns;
     private ViewBuilder builder;
@@ -70,37 +66,33 @@ public class View
     private SelectStatement select;
     private ReadQuery query;
 
-    public View(ViewDefinition definition,
+    public View(ViewMetadata definition,
                 ColumnFamilyStore baseCfs)
     {
         this.baseCfs = baseCfs;
-        this.name = definition.viewName;
+        this.name = definition.name;
         this.includeAllColumns = definition.includeAllColumns;
         this.rawSelect = definition.select;
 
         updateDefinition(definition);
     }
 
-    public ViewDefinition getDefinition()
+    public ViewMetadata getDefinition()
     {
         return definition;
     }
 
     /**
-     * This updates the columns stored which are dependent on the base CFMetaData.
-     *
-     * @return true if the view contains only columns which are part of the base's primary key; false if there is at
-     *         least one column which is not.
+     * This updates the columns stored which are dependent on the base TableMetadata.
      */
-    public void updateDefinition(ViewDefinition definition)
+    public void updateDefinition(ViewMetadata definition)
     {
         this.definition = definition;
 
-        CFMetaData viewCfm = definition.metadata;
-        List<ColumnDefinition> nonPKDefPartOfViewPK = new ArrayList<>();
-        for (ColumnDefinition baseColumn : baseCfs.metadata.allColumns())
+        List<ColumnMetadata> nonPKDefPartOfViewPK = new ArrayList<>();
+        for (ColumnMetadata baseColumn : baseCfs.metadata().columns())
         {
-            ColumnDefinition viewColumn = getViewColumn(baseColumn);
+            ColumnMetadata viewColumn = getViewColumn(baseColumn);
             if (viewColumn != null && !baseColumn.isPrimaryKeyColumn() && viewColumn.isPrimaryKeyColumn())
                 nonPKDefPartOfViewPK.add(baseColumn);
         }
@@ -111,18 +103,18 @@ public class View
      * The view column corresponding to the provided base column. This <b>can</b>
      * return {@code null} if the column is denormalized in the view.
      */
-    public ColumnDefinition getViewColumn(ColumnDefinition baseColumn)
+    public ColumnMetadata getViewColumn(ColumnMetadata baseColumn)
     {
-        return definition.metadata.getColumnDefinition(baseColumn.name);
+        return definition.metadata.getColumn(baseColumn.name);
     }
 
     /**
      * The base column corresponding to the provided view column. This should
      * never return {@code null} since a view can't have its "own" columns.
      */
-    public ColumnDefinition getBaseColumn(ColumnDefinition viewColumn)
+    public ColumnMetadata getBaseColumn(ColumnMetadata viewColumn)
     {
-        ColumnDefinition baseColumn = baseCfs.metadata.getColumnDefinition(viewColumn.name);
+        ColumnMetadata baseColumn = baseCfs.metadata().getColumn(viewColumn.name);
         assert baseColumn != null;
         return baseColumn;
     }
@@ -159,7 +151,7 @@ public class View
 
         for (ColumnData data : update)
         {
-            if (definition.metadata.getColumnDefinition(data.column().name) != null)
+            if (definition.metadata.getColumn(data.column().name) != null)
                 return true;
         }
         return false;
@@ -180,7 +172,7 @@ public class View
     public boolean matchesViewFilter(DecoratedKey partitionKey, Row baseRow, int nowInSec)
     {
         return getReadQuery().selectsClustering(partitionKey, baseRow.clustering())
-            && getSelectStatement().rowFilterForInternalCalls().isSatisfiedBy(baseCfs.metadata, partitionKey, baseRow, nowInSec);
+            && getSelectStatement().rowFilterForInternalCalls().isSatisfiedBy(baseCfs.metadata(), partitionKey, baseRow, nowInSec);
     }
 
     /**
@@ -208,7 +200,11 @@ public class View
     public ReadQuery getReadQuery()
     {
         if (query == null)
+        {
             query = getSelectStatement().getQuery(QueryOptions.forInternalCalls(Collections.emptyList()), FBUtilities.nowInSeconds());
+            logger.trace("View query: {}", rawSelect);
+        }
+
         return query;
     }
 
@@ -216,6 +212,7 @@ public class View
     {
         if (this.builder != null)
         {
+            logger.debug("Stopping current view builder due to schema change");
             this.builder.stop();
             this.builder = null;
         }
@@ -225,23 +222,22 @@ public class View
     }
 
     @Nullable
-    public static CFMetaData findBaseTable(String keyspace, String viewName)
+    public static TableMetadataRef findBaseTable(String keyspace, String viewName)
     {
-        ViewDefinition view = Schema.instance.getView(keyspace, viewName);
-        return (view == null) ? null : Schema.instance.getCFMetaData(view.baseTableId);
+        ViewMetadata view = Schema.instance.getView(keyspace, viewName);
+        return (view == null) ? null : Schema.instance.getTableMetadataRef(view.baseTableId);
     }
 
-    public static Iterable<ViewDefinition> findAll(String keyspace, String baseTable)
+    public static Iterable<ViewMetadata> findAll(String keyspace, String baseTable)
     {
-        KeyspaceMetadata ksm = Schema.instance.getKSMetaData(keyspace);
-        final UUID baseId = Schema.instance.getId(keyspace, baseTable);
-        return Iterables.filter(ksm.views, view -> view.baseTableId.equals(baseId));
+        KeyspaceMetadata ksm = Schema.instance.getKeyspaceMetadata(keyspace);
+        return Iterables.filter(ksm.views, view -> view.baseTableName.equals(baseTable));
     }
 
     /**
      * Builds the string text for a materialized view's SELECT statement.
      */
-    public static String buildSelectStatement(String cfName, Collection<ColumnDefinition> includedColumns, String whereClause)
+    public static String buildSelectStatement(String cfName, Collection<ColumnMetadata> includedColumns, String whereClause)
     {
          StringBuilder rawSelect = new StringBuilder("SELECT ");
         if (includedColumns == null || includedColumns.isEmpty())
@@ -262,12 +258,12 @@ public class View
             if (rel.isMultiColumn())
             {
                 sb.append(((MultiColumnRelation) rel).getEntities().stream()
-                        .map(ColumnIdentifier.Raw::toCQLString)
+                        .map(ColumnMetadata.Raw::toString)
                         .collect(Collectors.joining(", ", "(", ")")));
             }
             else
             {
-                sb.append(((SingleColumnRelation) rel).getEntity().toCQLString());
+                sb.append(((SingleColumnRelation) rel).getEntity());
             }
 
             sb.append(" ").append(rel.operator()).append(" ");

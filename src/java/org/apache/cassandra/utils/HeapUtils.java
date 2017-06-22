@@ -125,15 +125,16 @@ public final class HeapUtils
      */
     private static void logProcessOutput(Process p) throws IOException
     {
-        BufferedReader input = new BufferedReader(new InputStreamReader(p.getInputStream()));
-
-        StrBuilder builder = new StrBuilder();
-        String line;
-        while ((line = input.readLine()) != null)
+        try (BufferedReader input = new BufferedReader(new InputStreamReader(p.getInputStream())))
         {
-            builder.appendln(line);
+            StrBuilder builder = new StrBuilder();
+            String line;
+            while ((line = input.readLine()) != null)
+            {
+                builder.appendln(line);
+            }
+            logger.info(builder.toString());
         }
-        logger.info(builder.toString());
     }
 
     /**
@@ -168,11 +169,9 @@ public final class HeapUtils
      */
     private static Long getProcessId()
     {
-        // Once Java 9 is ready the process API should provide a better way to get the process ID.
-        long pid = SigarLibrary.instance.getPid();
-
+        long pid = NativeLibrary.getProcessID();
         if (pid >= 0)
-            return Long.valueOf(pid);
+            return pid;
 
         return getProcessIdFromJvmName();
     }
@@ -187,7 +186,7 @@ public final class HeapUtils
         String jvmName = ManagementFactory.getRuntimeMXBean().getName();
         try
         {
-            return Long.parseLong(jvmName.split("@")[0]);
+            return Long.valueOf(jvmName.split("@")[0]);
         }
         catch (NumberFormatException e)
         {

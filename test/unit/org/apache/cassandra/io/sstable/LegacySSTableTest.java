@@ -27,7 +27,6 @@ import java.util.Random;
 
 import org.junit.After;
 import org.junit.Assert;
-import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Ignore;
 import org.junit.Test;
@@ -36,6 +35,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.SchemaLoader;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.ColumnFamilyStore;
@@ -52,6 +52,7 @@ import org.apache.cassandra.service.CacheService;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.streaming.StreamPlan;
 import org.apache.cassandra.streaming.StreamSession;
+import org.apache.cassandra.streaming.StreamOperation;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 
@@ -71,7 +72,7 @@ public class LegacySSTableTest
      * See {@link #testGenerateSstables()} to generate sstables.
      * Take care on commit as you need to add the sstable files using {@code git add -f}
      */
-    public static final String[] legacyVersions = {"ma", "la", "ka", "jb"};
+    public static final String[] legacyVersions = {"na", "mc", "mb", "ma"};
 
     // 1200 chars
     static final String longString = "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789" +
@@ -90,6 +91,12 @@ public class LegacySSTableTest
     @BeforeClass
     public static void defineSchema() throws ConfigurationException
     {
+        String scp = System.getProperty(LEGACY_SSTABLE_PROP);
+        Assert.assertNotNull("System property " + LEGACY_SSTABLE_ROOT + " not set", scp);
+        
+        LEGACY_SSTABLE_ROOT = new File(scp).getAbsoluteFile();
+        Assert.assertTrue("System property " + LEGACY_SSTABLE_ROOT + " does not specify a directory", LEGACY_SSTABLE_ROOT.isDirectory());
+
         SchemaLoader.prepareServer();
         StorageService.instance.initServer();
         Keyspace.setInitialized();
@@ -98,10 +105,7 @@ public class LegacySSTableTest
         {
             createTables(legacyVersion);
         }
-        String scp = System.getProperty(LEGACY_SSTABLE_PROP);
-        assert scp != null;
-        LEGACY_SSTABLE_ROOT = new File(scp).getAbsoluteFile();
-        assert LEGACY_SSTABLE_ROOT.isDirectory();
+
     }
 
     @After
@@ -118,22 +122,42 @@ public class LegacySSTableTest
      */
     protected Descriptor getDescriptor(String legacyVersion, String table)
     {
-        return new Descriptor(legacyVersion, getTableDir(legacyVersion, table), "legacy_tables", table, 1,
-                              BigFormat.instance.getVersion(legacyVersion).hasNewFileName()?
-                              SSTableFormat.Type.BIG :SSTableFormat.Type.LEGACY);
+        return new Descriptor(SSTableFormat.Type.BIG.info.getVersion(legacyVersion),
+                              getTableDir(legacyVersion, table),
+                              "legacy_tables",
+                              table,
+                              1,
+                              SSTableFormat.Type.BIG);
     }
 
     @Test
     public void testLoadLegacyCqlTables() throws Exception
     {
+        DatabaseDescriptor.setColumnIndexCacheSize(99999);
+        CacheService.instance.invalidateKeyCache();
+        doTestLegacyCqlTables();
+    }
+
+    @Test
+    public void testLoadLegacyCqlTablesShallow() throws Exception
+    {
+        DatabaseDescriptor.setColumnIndexCacheSize(0);
+        CacheService.instance.invalidateKeyCache();
+        doTestLegacyCqlTables();
+    }
+
+    private void doTestLegacyCqlTables() throws Exception
+    {
         for (String legacyVersion : legacyVersions)
         {
             logger.info("Loading legacy version: {}", legacyVersion);
+            truncateLegacyTables(legacyVersion);
             loadLegacyTables(legacyVersion);
             CacheService.instance.invalidateKeyCache();
             long startCount = CacheService.instance.keyCache.size();
             verifyReads(legacyVersion);
             verifyCache(legacyVersion, startCount);
+            compactLegacyTables(legacyVersion);
         }
     }
 
@@ -170,9 +194,33 @@ public class LegacySSTableTest
         ArrayList<StreamSession.SSTableStreamingSections> details = new ArrayList<>();
         details.add(new StreamSession.SSTableStreamingSections(sstable.ref(),
                                                                sstable.getPositionsForRanges(ranges),
-                                                               sstable.estimatedKeysForRanges(ranges), sstable.getSSTableMetadata().repairedAt));
-        new StreamPlan("LegacyStreamingTest").transferFiles(FBUtilities.getBroadcastAddress(), details)
-                                             .execute().get();
+                                                               sstable.estimatedKeysForRanges(ranges)));
+        new StreamPlan(StreamOperation.OTHER).transferFiles(FBUtilities.getBroadcastAddress(), details)
+                                  .execute().get();
+    }
+
+    private static void truncateLegacyTables(String legacyVersion) throws Exception
+    {
+        for (int compact = 0; compact <= 1; compact++)
+        {
+            logger.info("Truncating legacy version {}{}", legacyVersion, getCompactNameSuffix(compact));
+            Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_simple%s", legacyVersion, getCompactNameSuffix(compact))).truncateBlocking();
+            Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_simple_counter%s", legacyVersion, getCompactNameSuffix(compact))).truncateBlocking();
+            Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_clust%s", legacyVersion, getCompactNameSuffix(compact))).truncateBlocking();
+            Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_clust_counter%s", legacyVersion, getCompactNameSuffix(compact))).truncateBlocking();
+        }
+    }
+
+    private static void compactLegacyTables(String legacyVersion) throws Exception
+    {
+        for (int compact = 0; compact <= 1; compact++)
+        {
+            logger.info("Compacting legacy version {}{}", legacyVersion, getCompactNameSuffix(compact));
+            Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_simple%s", legacyVersion, getCompactNameSuffix(compact))).forceMajorCompaction();
+            Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_simple_counter%s", legacyVersion, getCompactNameSuffix(compact))).forceMajorCompaction();
+            Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_clust%s", legacyVersion, getCompactNameSuffix(compact))).forceMajorCompaction();
+            Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_clust_counter%s", legacyVersion, getCompactNameSuffix(compact))).forceMajorCompaction();
+        }
     }
 
     private static void loadLegacyTables(String legacyVersion) throws Exception
@@ -198,10 +246,7 @@ public class LegacySSTableTest
         CacheService.instance.invalidateKeyCache();
         Assert.assertEquals(startCount, CacheService.instance.keyCache.size());
         CacheService.instance.keyCache.loadSaved();
-        if (BigFormat.instance.getVersion(legacyVersion).storeRows())
-            Assert.assertEquals(endCount, CacheService.instance.keyCache.size());
-        else
-            Assert.assertEquals(startCount, CacheService.instance.keyCache.size());
+        Assert.assertEquals(endCount, CacheService.instance.keyCache.size());
     }
 
     private static void verifyReads(String legacyVersion)
@@ -413,7 +458,9 @@ public class LegacySSTableTest
 
     private static void copySstablesToTestData(String legacyVersion, String table, File cfDir) throws IOException
     {
-        for (File file : getTableDir(legacyVersion, table).listFiles())
+        File tableDir = getTableDir(legacyVersion, table);
+        Assert.assertTrue("The table directory " + tableDir + " was not found", tableDir.isDirectory());
+        for (File file : tableDir.listFiles())
         {
             copyFile(cfDir, file);
         }
@@ -431,10 +478,11 @@ public class LegacySSTableTest
         {
             File target = new File(cfDir, file.getName());
             int rd;
-            FileInputStream is = new FileInputStream(file);
-            FileOutputStream os = new FileOutputStream(target);
-            while ((rd = is.read(buf)) >= 0)
-                os.write(buf, 0, rd);
+            try (FileInputStream is = new FileInputStream(file);
+                 FileOutputStream os = new FileOutputStream(target);) {
+                while ((rd = is.read(buf)) >= 0)
+                    os.write(buf, 0, rd);
+                }
         }
     }
 }

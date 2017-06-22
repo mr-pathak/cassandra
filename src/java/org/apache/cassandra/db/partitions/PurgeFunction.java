@@ -17,28 +17,28 @@
  */
 package org.apache.cassandra.db.partitions;
 
+import java.util.function.Predicate;
+
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.transform.Transformation;
 
 public abstract class PurgeFunction extends Transformation<UnfilteredRowIterator>
 {
-    private final boolean isForThrift;
     private final DeletionPurger purger;
     private final int nowInSec;
     private boolean isReverseOrder;
 
-    public PurgeFunction(boolean isForThrift, int nowInSec, int gcBefore, int oldestUnrepairedTombstone, boolean onlyPurgeRepairedTombstones)
+    public PurgeFunction(int nowInSec, int gcBefore, int oldestUnrepairedTombstone, boolean onlyPurgeRepairedTombstones)
     {
-        this.isForThrift = isForThrift;
         this.nowInSec = nowInSec;
         this.purger = (timestamp, localDeletionTime) ->
                       !(onlyPurgeRepairedTombstones && localDeletionTime >= oldestUnrepairedTombstone)
                       && localDeletionTime < gcBefore
-                      && timestamp < getMaxPurgeableTimestamp();
+                      && getPurgeEvaluator().test(timestamp);
     }
 
-    protected abstract long getMaxPurgeableTimestamp();
+    protected abstract Predicate<Long> getPurgeEvaluator();
 
     // Called at the beginning of each new partition
     protected void onNewPartition(DecoratedKey partitionKey)
@@ -55,13 +55,14 @@ public abstract class PurgeFunction extends Transformation<UnfilteredRowIterator
     {
     }
 
-    public UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
+    @Override
+    protected UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
     {
         onNewPartition(partition.partitionKey());
 
         isReverseOrder = partition.isReverseOrder();
         UnfilteredRowIterator purged = Transformation.apply(partition, this);
-        if (!isForThrift && purged.isEmpty())
+        if (purged.isEmpty())
         {
             onEmptyPartitionPostPurge(purged.partitionKey());
             purged.close();
@@ -71,24 +72,28 @@ public abstract class PurgeFunction extends Transformation<UnfilteredRowIterator
         return purged;
     }
 
-    public DeletionTime applyToDeletion(DeletionTime deletionTime)
+    @Override
+    protected DeletionTime applyToDeletion(DeletionTime deletionTime)
     {
         return purger.shouldPurge(deletionTime) ? DeletionTime.LIVE : deletionTime;
     }
 
-    public Row applyToStatic(Row row)
+    @Override
+    protected Row applyToStatic(Row row)
     {
         updateProgress();
         return row.purge(purger, nowInSec);
     }
 
-    public Row applyToRow(Row row)
+    @Override
+    protected Row applyToRow(Row row)
     {
         updateProgress();
         return row.purge(purger, nowInSec);
     }
 
-    public RangeTombstoneMarker applyToMarker(RangeTombstoneMarker marker)
+    @Override
+    protected RangeTombstoneMarker applyToMarker(RangeTombstoneMarker marker)
     {
         updateProgress();
         boolean reversed = isReverseOrder;

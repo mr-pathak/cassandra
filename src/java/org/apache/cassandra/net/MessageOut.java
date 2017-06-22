@@ -27,9 +27,9 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableMap;
 
 import org.apache.cassandra.concurrent.Stage;
-import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.FBUtilities;
@@ -90,7 +90,7 @@ public class MessageOut<T>
 
     public long getTimeout()
     {
-        return DatabaseDescriptor.getTimeout(verb);
+        return verb.getTimeout();
     }
 
     public String toString()
@@ -104,7 +104,7 @@ public class MessageOut<T>
     {
         CompactEndpointSerializationHelper.serialize(from, out);
 
-        out.writeInt(verb.ordinal());
+        out.writeInt(verb.getId());
         out.writeInt(parameters.size());
         for (Map.Entry<String, byte[]> entry : parameters.entrySet())
         {
@@ -113,18 +113,28 @@ public class MessageOut<T>
             out.write(entry.getValue());
         }
 
-        long longSize = payloadSize(version);
-        assert longSize <= Integer.MAX_VALUE; // larger values are supported in sstables but not messages
-        out.writeInt((int) longSize);
         if (payload != null)
-            serializer.serialize(payload, out, version);
+        {
+            try(DataOutputBuffer dob = DataOutputBuffer.scratchBuffer.get())
+            {
+                serializer.serialize(payload, dob, version);
+
+                int size = dob.getLength();
+                out.writeInt(size);
+                out.write(dob.getData(), 0, size);
+            }
+        }
+        else
+        {
+            out.writeInt(0);
+        }
     }
 
     public int serializedSize(int version)
     {
         int size = CompactEndpointSerializationHelper.serializedSize(from);
 
-        size += TypeSizes.sizeof(verb.ordinal());
+        size += TypeSizes.sizeof(verb.getId());
         size += TypeSizes.sizeof(parameters.size());
         for (Map.Entry<String, byte[]> entry : parameters.entrySet())
         {

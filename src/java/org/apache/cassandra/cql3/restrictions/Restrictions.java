@@ -17,15 +17,27 @@
  */
 package org.apache.cassandra.cql3.restrictions;
 
+import java.util.Set;
+
+import org.apache.cassandra.schema.ColumnMetadata;
+
 /**
  * Sets of restrictions
  */
 public interface Restrictions extends Restriction
 {
     /**
-     * Checks if this <code>PrimaryKeyRestrictionSet</code> is empty or not.
+     * Returns the restrictions applied to the specified column.
      *
-     * @return <code>true</code> if this <code>PrimaryKeyRestrictionSet</code> is empty, <code>false</code> otherwise.
+     * @param columnDef the column definition
+     * @return the restrictions applied to the specified column
+     */
+    Set<Restriction> getRestrictions(ColumnMetadata columnDef);
+
+    /**
+     * Checks if this <code>Restrictions</code> is empty or not.
+     *
+     * @return <code>true</code> if this <code>Restrictions</code> is empty, <code>false</code> otherwise.
      */
     boolean isEmpty();
 
@@ -41,6 +53,17 @@ public interface Restrictions extends Restriction
      * @return <code>true</code> if any of the underlying restriction is an IN, <code>false</code> otherwise
      */
     public boolean hasIN();
+
+    /**
+     * Checks if any of the underlying restrictions is a CONTAINS / CONTAINS KEY restriction.
+     * @return <code>true</code> if any of the underlying restrictions is CONTAINS, <code>false</code> otherwise
+     */
+    public boolean hasContains();
+    /**
+     * Checks if any of the underlying restrictions is a slice.
+     * @return <code>true</code> if any of the underlying restrictions is a slice, <code>false</code> otherwise
+     */
+    public boolean hasSlice();
 
     /**
      * Checks if all of the underlying restrictions are EQ or IN restrictions.

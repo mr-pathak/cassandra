@@ -1,6 +1,5 @@
-<link rel="StyleSheet" href="CQL.css" type="text/css" media="screen">
 
-h1. Cassandra Query Language (CQL) v3.4.2
+h1. Cassandra Query Language (CQL) v3.4.3
 
 
 
@@ -346,7 +345,7 @@ Table creation supports the following other @<property>@:
 
 h4(#compactionOptions). Compaction options
 
-The @compaction@ property must at least define the @'class'@ sub-option, that defines the compaction strategy class to use. The default supported class are @'SizeTieredCompactionStrategy'@, @'LeveledCompactionStrategy'@ and @'DateTieredCompactionStrategy'@. Custom strategy can be provided by specifying the full class name as a "string constant":#constants. The rest of the sub-options depends on the chosen class. The sub-options supported by the default classes are:
+The @compaction@ property must at least define the @'class'@ sub-option, that defines the compaction strategy class to use. The default supported class are @'SizeTieredCompactionStrategy'@, @'LeveledCompactionStrategy'@, @'DateTieredCompactionStrategy'@ and @'TimeWindowCompactionStrategy'@. Custom strategy can be provided by specifying the full class name as a "string constant":#constants. The rest of the sub-options depends on the chosen class. The sub-options supported by the default classes are:
 
 |_. option                         |_. supported compaction strategy |_. default    |_. description |
 | @enabled@                        | _all_                           | true         | A boolean denoting whether compaction should be enabled or not.|
@@ -362,6 +361,9 @@ The @compaction@ property must at least define the @'class'@ sub-option, that de
 | @timestamp_resolution@           | DateTieredCompactionStrategy    | MICROSECONDS | The timestamp resolution used when inserting data, could be MILLISECONDS, MICROSECONDS etc (should be understandable by Java TimeUnit) - don't change this unless you do mutations with USING TIMESTAMP <non_microsecond_timestamps> (or equivalent directly in the client)|
 | @base_time_seconds@              | DateTieredCompactionStrategy    | 60           | The base size of the time windows. |
 | @max_sstable_age_days@           | DateTieredCompactionStrategy    | 365          | SSTables only containing data that is older than this will never be compacted. |
+| @timestamp_resolution@           | TimeWindowCompactionStrategy    | MICROSECONDS | The timestamp resolution used when inserting data, could be MILLISECONDS, MICROSECONDS etc (should be understandable by Java TimeUnit) - don't change this unless you do mutations with USING TIMESTAMP <non_microsecond_timestamps> (or equivalent directly in the client)|
+| @compaction_window_unit@         | TimeWindowCompactionStrategy    | DAYS         | The Java TimeUnit used for the window size, set in conjunction with @compaction_window_size@. Must be one of DAYS, HOURS, MINUTES |
+| @compaction_window_size@         | TimeWindowCompactionStrategy    | 1            | The number of @compaction_window_unit@ units that make up a time window. |
 
 
 h4(#compressionOptions). Compression options
@@ -394,8 +396,7 @@ __Syntax:__
 bc(syntax).. 
 <alter-table-stmt> ::= ALTER (TABLE | COLUMNFAMILY) <tablename> <instruction>
 
-<instruction> ::= ALTER <identifier> TYPE <type>
-                | ADD   <identifier> <type>
+<instruction> ::= ADD   <identifier> <type>
                 | ADD   ( <identifier> <type> ( , <identifier> <type> )* )
                 | DROP  <identifier>
                 | DROP  ( <identifier> ( , <identifier> )* )
@@ -405,7 +406,6 @@ __Sample:__
 
 bc(sample).. 
 ALTER TABLE addamsFamily
-ALTER lastKnownLocation TYPE uuid;
 
 ALTER TABLE addamsFamily
 ADD gravesite varchar;
@@ -414,13 +414,34 @@ ALTER TABLE addamsFamily
 WITH comment = 'A most excellent and useful column family'
  AND read_repair_chance = 0.2;
 p. 
-The @ALTER@ statement is used to manipulate table definitions. It allows for adding new columns, dropping existing ones, changing the type of existing columns, or updating the table options. As with table creation, @ALTER COLUMNFAMILY@ is allowed as an alias for @ALTER TABLE@.
+The @ALTER@ statement is used to manipulate table definitions. It allows for adding new columns, dropping existing ones, or updating the table options. As with table creation, @ALTER COLUMNFAMILY@ is allowed as an alias for @ALTER TABLE@.
 
 The @<tablename>@ is the table name optionally preceded by the keyspace name.  The @<instruction>@ defines the alteration to perform:
-* @ALTER@: Update the type of a given defined column. Note that the type of the "clustering columns":#createTablepartitionClustering cannot be modified as it induces the on-disk ordering of rows. Columns on which a "secondary index":#createIndexStmt is defined have the same restriction. Other columns are free from those restrictions (no validation of existing data is performed), but it is usually a bad idea to change the type to a non-compatible one, unless no data have been inserted for that column yet, as this could confuse CQL drivers/tools.
 * @ADD@: Adds a new column to the table. The @<identifier>@ for the new column must not conflict with an existing column. Moreover, columns cannot be added to tables defined with the @COMPACT STORAGE@ option.
 * @DROP@: Removes a column from the table. Dropped columns will immediately become unavailable in the queries and will not be included in compacted sstables in the future. If a column is readded, queries won't return values written before the column was last dropped. It is assumed that timestamps represent actual time, so if this is not your case, you should NOT readd previously dropped columns. Columns can't be dropped from tables defined with the @COMPACT STORAGE@ option.
 * @WITH@: Allows to update the options of the table. The "supported @<option>@":#createTableOptions (and syntax) are the same as for the @CREATE TABLE@ statement except that @COMPACT STORAGE@ is not supported. Note that setting any @compaction@ sub-options has the effect of erasing all previous @compaction@ options, so you  need to re-specify all the sub-options if you want to keep them. The same note applies to the set of @compression@ sub-options.
+
+h4. CQL type compatibility:
+
+CQL data types may be converted only as the following table.
+
+|_. Data type may be altered to:|_.Data type|
+|timestamp|bigint|
+|ascii, bigint, boolean, date, decimal, double, float, inet, int, smallint, text, time, timestamp, timeuuid, tinyint, uuid, varchar, varint|blob|
+|int|date|
+|ascii, varchar|text|
+|bigint|time|
+|bigint|timestamp|
+|timeuuid|uuid|
+|ascii, text|varchar|
+|bigint, int, timestamp|varint|
+
+Clustering columns have stricter requirements, only the below conversions are allowed.
+
+|_. Data type may be altered to:|_.Data type|
+|ascii, text, varchar|blob|
+|ascii, varchar|text|
+|ascii, text|varchar|
 
 h3(#dropTableStmt). DROP TABLE
 
@@ -597,22 +618,17 @@ __Syntax:__
 bc(syntax).. 
 <alter-type-stmt> ::= ALTER TYPE <typename> <instruction>
 
-<instruction> ::= ALTER <field-name> TYPE <type>
-                | ADD <field-name> <type>
+<instruction> ::= ADD <field-name> <type>
                 | RENAME <field-name> TO <field-name> ( AND <field-name> TO <field-name> )*
 p. 
 __Sample:__
 
 bc(sample).. 
-ALTER TYPE address ALTER zip TYPE varint
-
 ALTER TYPE address ADD country text
 
 ALTER TYPE address RENAME zip TO zipcode AND street_name TO street
 p. 
 The @ALTER TYPE@ statement is used to manipulate type definitions. It allows for adding new fields, renaming existing fields, or changing the type of existing fields.
-
-When altering the type of a column, the new type must be compatible with the previous type.
 
 h3(#dropTypeStmt). DROP TYPE
 
@@ -828,10 +844,7 @@ bc(syntax)..
 
 <names-list> ::= '(' <identifier> ( ',' <identifier> )* ')'
 
-<value-list> ::= '(' <term-or-literal> ( ',' <term-or-literal> )* ')'
-
-<term-or-literal> ::= <term>
-                    | <collection-literal>
+<value-list> ::= '(' <term> ( ',' <term> )* ')'
 
 <option> ::= TIMESTAMP <integer>
            | TTL <integer>
@@ -1039,22 +1052,27 @@ bc(syntax)..
 <select-stmt> ::= SELECT ( JSON )? <select-clause>
                   FROM <tablename>
                   ( WHERE <where-clause> )?
+                  ( GROUP BY <group-by>)?
                   ( ORDER BY <order-by> )?
                   ( PER PARTITION LIMIT <integer> )?
                   ( LIMIT <integer> )?
                   ( ALLOW FILTERING )?
 
 <select-clause> ::= DISTINCT? <selection-list>
-                  | COUNT '(' ( '*' | '1' ) ')' (AS <identifier>)?
 
 <selection-list> ::= <selector> (AS <identifier>)? ( ',' <selector> (AS <identifier>)? )*
                    | '*'
 
 <selector> ::= <identifier>
+             | <term>
              | WRITETIME '(' <identifier> ')'
+             | COUNT '(' '*' ')'
              | TTL '(' <identifier> ')'
              | CAST '(' <selector> AS <type> ')'
              | <function> '(' (<selector> (',' <selector>)*)? ')'
+             | <selector> '.' <identifier>
+             | <selector> '[' <term> ']'
+             | <selector> '[' <term>? .. <term>? ']'
 
 <where-clause> ::= <relation> ( AND <relation> )*
 
@@ -1065,6 +1083,7 @@ bc(syntax)..
              | TOKEN '(' <identifier> ( ',' <identifer>)* ')' <op> <term>
 
 <op> ::= '=' | '<' | '>' | '<=' | '>=' | CONTAINS | CONTAINS KEY
+<group-by> ::= <identifier> (',' <identifier>)*
 <order-by> ::= <ordering> ( ',' <odering> )*
 <ordering> ::= <identifer> ( ASC | DESC )?
 <term-tuple> ::= '(' <term> (',' <term>)* ')'
@@ -1096,6 +1115,8 @@ h4(#selectSelection). @<select-clause>@
 The @<select-clause>@ determines which columns needs to be queried and returned in the result-set. It consists of either the comma-separated list of <selector> or the wildcard character (@*@) to select all the columns defined for the table.
 
 A @<selector>@ is either a column name to retrieve or a @<function>@ of one or more @<term>@s. The function allowed are the same as for @<term>@ and are described in the "function section":#functions. In addition to these generic functions, the @WRITETIME@ (resp. @TTL@) function allows to select the timestamp of when the column was inserted (resp. the time to live (in seconds) for the column (or null if the column has no expiration set)) and the "@CAST@":#castFun function can be used to convert one data type to another.
+
+Additionally, individual values of maps and sets can be selected using @[ <term> ]@. For maps, this will return the value corresponding to the key, if such entry exists. For sets, this will return the key that is selected if it exists and is thus mainly a way to check element existence. It is also possible to select a slice of a set or map with @[ <term> ... <term> @], where both bound can be omitted.
 
 Any @<selector>@ can be aliased using @AS@ keyword (see examples). Please note that @<where-clause>@ and @<order-by>@ clause should refer to the columns by their original names and not by their aliases.
 
@@ -1158,6 +1179,16 @@ h4(#selectOrderBy). @<order-by>@
 The @ORDER BY@ option allows to select the order of the returned results. It takes as argument a list of column names along with the order for the column (@ASC@ for ascendant and @DESC@ for descendant, omitting the order being equivalent to @ASC@). Currently the possible orderings are limited (which depends on the table "@CLUSTERING ORDER@":#createTableOptions ):
 * if the table has been defined without any specific @CLUSTERING ORDER@, then then allowed orderings are the order induced by the clustering columns and the reverse of that one.
 * otherwise, the orderings allowed are the order of the @CLUSTERING ORDER@ option and the reversed one.
+
+h4(#selectGroupBy). @<group-by>@
+
+The @GROUP BY@ option allows to condense into a single row all selected rows that share the same values for a set of columns.
+
+Using the @GROUP BY@ option, it is only possible to group rows at the partition key level or at a clustering column level. By consequence, the @GROUP BY@ option only accept as arguments primary key column names in the primary key order. If a primary key column is restricted by an equality restriction it is not required to be present in the @GROUP BY@ clause.
+
+Aggregate functions will produce a separate value for each group. If no @GROUP BY@ clause is specified, aggregates functions will produce a single value for all the rows.
+
+If a column is selected without an aggregate function, in a statement with a @GROUP BY@, the first value encounter in each group will be returned.
 
 h4(#selectLimit). @LIMIT@ and @PER PARTITION LIMIT@
 
@@ -1653,7 +1684,9 @@ Show any permissions granted to @carlos@ or any of @carlos@'s roles, limited to 
 
 h2(#types). Data Types
 
-CQL supports a rich set of data types for columns defined in a table, including collection types. On top of those native and collection types, users can also provide custom types (through a JAVA class extending @AbstractType@ loadable by Cassandra). The syntax of types is thus:
+CQL supports a rich set of data types for columns defined in a table, including collection types. On top of those native
+and collection types, users can also provide custom types (through a JAVA class extending @AbstractType@ loadable by
+Cassandra). The syntax of types is thus:
 
 bc(syntax).. 
 <type> ::= <native-type>
@@ -2042,7 +2075,7 @@ SELECT AVG(players) FROM plays;
 
 h2(#udfs). User-Defined Functions
 
-User-defined functions allow execution of user-provided code in Cassandra. By default, Cassandra supports defining functions in _Java_ and _JavaScript_. Support for other JSR 223 compliant scripting languages (such as Python, Ruby, and Scala) can be added by adding a JAR to the classpath.
+User-defined functions allow execution of user-provided code in Cassandra. By default, Cassandra supports defining functions in _Java_ and _JavaScript_. Support for other JSR 223 compliant scripting languages (such as Python, Ruby, and Scala) has been removed in 3.0.11.
 
 UDFs are part of the Cassandra schema.  As such, they are automatically propagated to all nodes in the cluster.
 
@@ -2387,6 +2420,14 @@ The following type names are not currently used by CQL, but are reserved for pot
 h2(#changes). Changes
 
 The following describes the changes in each version of CQL.
+
+h3. 3.4.3
+
+* Support for @GROUP BY@. See "@<group-by>@":#selectGroupBy (see "CASSANDRA-10707":https://issues.apache.org/jira/browse/CASSANDRA-10707).
+
+h3. 3.4.2
+
+* Support for selecting elements and slices of a collection ("CASSANDRA-7396":https://issues.apache.org/jira/browse/CASSANDRA-7396).
 
 h3. 3.4.2
 

@@ -19,15 +19,14 @@ package org.apache.cassandra.db.compaction;
 
 import java.util.*;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.base.Predicate;
 import com.google.common.collect.Iterables;
-import com.google.common.util.concurrent.RateLimiter;
 
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.SerializationHeader;
-import org.apache.cassandra.db.lifecycle.SSTableSet;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.SSTableMultiWriter;
@@ -45,6 +44,7 @@ import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.ISSTableScanner;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
+import org.apache.cassandra.schema.CompactionParams;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 
 /**
@@ -126,7 +126,7 @@ public abstract class AbstractCompactionStrategy
             uncheckedTombstoneCompaction = DEFAULT_UNCHECKED_TOMBSTONE_COMPACTION_OPTION;
         }
 
-        directories = new Directories(cfs.metadata, Directories.dataDirectories);
+        directories = cfs.getDirectories();
     }
 
     public Directories getDirectories()
@@ -213,10 +213,12 @@ public abstract class AbstractCompactionStrategy
      */
     public abstract long getMaxSSTableBytes();
 
+    @Deprecated
     public void enable()
     {
     }
 
+    @Deprecated
     public void disable()
     {
     }
@@ -283,12 +285,11 @@ public abstract class AbstractCompactionStrategy
     @SuppressWarnings("resource")
     public ScannerList getScanners(Collection<SSTableReader> sstables, Collection<Range<Token>> ranges)
     {
-        RateLimiter limiter = CompactionManager.instance.getRateLimiter();
         ArrayList<ISSTableScanner> scanners = new ArrayList<ISSTableScanner>();
         try
         {
             for (SSTableReader sstable : sstables)
-                scanners.add(sstable.getScanner(ranges, limiter));
+                scanners.add(sstable.getScanner(ranges));
         }
         catch (Throwable t)
         {
@@ -333,12 +334,53 @@ public abstract class AbstractCompactionStrategy
 
     public abstract void removeSSTable(SSTableReader sstable);
 
+    /**
+     * Returns the sstables managed by this strategy instance
+     */
+    @VisibleForTesting
+    protected abstract Set<SSTableReader> getSSTables();
+
     public static class ScannerList implements AutoCloseable
     {
         public final List<ISSTableScanner> scanners;
         public ScannerList(List<ISSTableScanner> scanners)
         {
             this.scanners = scanners;
+        }
+
+        public long getTotalBytesScanned()
+        {
+            long bytesScanned = 0L;
+            for (ISSTableScanner scanner : scanners)
+                bytesScanned += scanner.getBytesScanned();
+
+            return bytesScanned;
+        }
+
+        public long getTotalCompressedSize()
+        {
+            long compressedSize = 0;
+            for (ISSTableScanner scanner : scanners)
+                compressedSize += scanner.getCompressedLengthInBytes();
+
+            return compressedSize;
+        }
+
+        public double getCompressionRatio()
+        {
+            double compressed = 0.0;
+            double uncompressed = 0.0;
+
+            for (ISSTableScanner scanner : scanners)
+            {
+                compressed += scanner.getCompressedLengthInBytes();
+                uncompressed += scanner.getLengthInBytes();
+            }
+
+            if (compressed == uncompressed || uncompressed == 0)
+                return MetadataCollector.NO_COMPRESSION_RATIO;
+
+            return compressed / uncompressed;
         }
 
         public void close()
@@ -379,7 +421,7 @@ public abstract class AbstractCompactionStrategy
      */
     protected boolean worthDroppingTombstones(SSTableReader sstable, int gcBefore)
     {
-        if (disableTombstoneCompactions)
+        if (disableTombstoneCompactions || CompactionController.NEVER_PURGE_TOMBSTONES)
             return false;
         // since we use estimations to calculate, there is a chance that compaction will not drop tombstones actually.
         // if that happens we will end up in infinite compaction loop, so first we check enough if enough time has
@@ -395,7 +437,7 @@ public abstract class AbstractCompactionStrategy
         if (uncheckedTombstoneCompaction)
             return true;
 
-        Collection<SSTableReader> overlaps = cfs.getOverlappingSSTables(SSTableSet.CANONICAL, Collections.singleton(sstable));
+        Collection<SSTableReader> overlaps = cfs.getOverlappingLiveSSTables(Collections.singleton(sstable));
         if (overlaps.isEmpty())
         {
             // there is no overlap, tombstones are safely droppable
@@ -496,9 +538,11 @@ public abstract class AbstractCompactionStrategy
         uncheckedOptions.remove(LOG_ALL_OPTION);
         uncheckedOptions.remove(COMPACTION_ENABLED);
         uncheckedOptions.remove(ONLY_PURGE_REPAIRED_TOMBSTONES);
+        uncheckedOptions.remove(CompactionParams.Option.PROVIDE_OVERLAPPING_TOMBSTONES.toString());
         return uncheckedOptions;
     }
 
+    @Deprecated
     public boolean shouldBeEnabled()
     {
         String optionValue = options.get(COMPACTION_ENABLED);
@@ -545,11 +589,17 @@ public abstract class AbstractCompactionStrategy
     public SSTableMultiWriter createSSTableMultiWriter(Descriptor descriptor,
                                                        long keyCount,
                                                        long repairedAt,
+                                                       UUID pendingRepair,
                                                        MetadataCollector meta,
                                                        SerializationHeader header,
                                                        Collection<Index> indexes,
                                                        LifecycleTransaction txn)
     {
-        return SimpleSSTableMultiWriter.create(descriptor, keyCount, repairedAt, cfs.metadata, meta, header, indexes, txn);
+        return SimpleSSTableMultiWriter.create(descriptor, keyCount, repairedAt, pendingRepair, cfs.metadata, meta, header, indexes, txn);
+    }
+
+    public boolean supportsEarlyOpen()
+    {
+        return true;
     }
 }

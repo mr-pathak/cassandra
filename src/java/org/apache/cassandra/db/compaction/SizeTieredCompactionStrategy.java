@@ -102,8 +102,7 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
         if (sstablesWithTombstones.isEmpty())
             return Collections.emptyList();
 
-        Collections.sort(sstablesWithTombstones, new SSTableReader.SizeComparator());
-        return Collections.singletonList(sstablesWithTombstones.get(0));
+        return Collections.singletonList(Collections.max(sstablesWithTombstones, SSTableReader.sizeComparator));
     }
 
 
@@ -327,6 +326,12 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
     public void removeSSTable(SSTableReader sstable)
     {
         sstables.remove(sstable);
+    }
+
+    @Override
+    protected Set<SSTableReader> getSSTables()
+    {
+        return ImmutableSet.copyOf(sstables);
     }
 
     public String toString()

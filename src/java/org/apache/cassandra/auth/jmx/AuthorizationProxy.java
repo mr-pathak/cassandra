@@ -29,7 +29,6 @@ import java.util.stream.Collectors;
 import javax.management.MBeanServer;
 import javax.management.MalformedObjectNameException;
 import javax.management.ObjectName;
-import javax.management.remote.MBeanServerForwarder;
 import javax.security.auth.Subject;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -40,9 +39,7 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.auth.*;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.FBUtilities;
 
 /**
  * Provides a proxy interface to the platform's MBeanServer instance to perform
@@ -496,17 +493,7 @@ public class AuthorizationProxy implements InvocationHandler
 
         public Set<PermissionDetails> get(RoleResource roleResource)
         {
-            try
-            {
-                return super.get(roleResource);
-            }
-            catch (Exception e)
-            {
-                // because the outer class uses this method as Function<RoleResource, Set<PermissionDetails>>,
-                // which can be overridden for testing, it cannot throw checked exceptions. So here we simply
-                // use guava's propagation helper.
-                throw Throwables.propagate(e);
-            }
+            return super.get(roleResource);
         }
     }
 }
